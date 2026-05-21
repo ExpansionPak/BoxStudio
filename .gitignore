@@ -1,0 +1,12 @@
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Build outputs & temporary files
+build/
+*.exe
+
+# ROM Files
+*.z64
+*.v64
+*.n64
