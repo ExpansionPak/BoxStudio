@@ -1,7 +1,7 @@
 # BoxStudio
 **BoxStudio** is a **visual editor** for decomp bases like [HackerSM64](https://github.com/HackerN64/HackerSM64), [zeldaret's OoT Decomp](https://github.com/zeldaret/oot), and [zeldaret's MM decomp](https://github.com/zeldaret/mm), providing a much more manageable way for creating ROM Hacks with decomp bases. Think of it as a game engine like [Unity](https://unity.com/) or [Godot](https://godotengine.org/) for creating ROM Hacks for N64 games.
 
-While **BoxStudio** was initially started as a visual editor for **literally** hacking the ROM and it's **Raw Asssembly** with C code side-by-side pulled from decomp GitHubs, the goal was later changed for many reasons, but it's mostly because **Raw Rom Hacking** (RRH) is a pain in the ass even if you have the C code next to the raw assembly.
+While **BoxStudio** was initially started as a visual editor for **literally** hacking the ROM and it's **Raw Asssembly** with C code side-by-side pulled from decomp GitHubs, the goal was later changed for many reasons, but it's mostly because **Raw Rom Hacking** (RRH) is a **pain in the ass** even if you have the C code next to the raw assembly.
 
 > Note: This project does NOT use any proprietary N64 SDKs or libraries.
 
