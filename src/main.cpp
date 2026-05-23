@@ -6,6 +6,8 @@
 #include <filesystem>
 namespace fs = std::filesystem;
 
+#pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
+
 // Data
 static ID3D11Device*            g_pd3dDevice = nullptr;
 static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
@@ -41,9 +43,15 @@ bool is_valid_dir = false;
 // Main code
 int main(int, char**)
 {
+    // Force a console to open so you can read native assert logs
+    ::AllocConsole();
+    freopen_s((FILE**)stdout, "CONOUT$", "w", stdout);
+
     // Make process DPI aware and obtain main monitor scale
     ImGui_ImplWin32_EnableDpiAwareness();
-    float main_scale = ImGui_ImplWin32_GetDpiScaleForMonitor(::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
+
+    HMONITOR monitor = ::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    float main_scale = (monitor != nullptr) ? ImGui_ImplWin32_GetDpiScaleForMonitor(monitor) : 1.0f;
 
     // Create application window with borderless sizing flags
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"ImGui Project", nullptr };
@@ -78,7 +86,7 @@ int main(int, char**)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;           // Enable Docking
-    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;         // Enable Multi-Viewport / Platform Windows
+    // io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;         // Enable Multi-Viewport / Platform Windows
     io.ConfigFlags |= ImGuiConfigFlags_DpiEnableScaleFonts;     // Automatically scales fonts per-viewport
     io.ConfigFlags |= ImGuiConfigFlags_DpiEnableScaleViewports; // Scales the UI windows based on monitor DPIs
 
@@ -89,11 +97,10 @@ int main(int, char**)
 
     // Setup scaling
     ImGuiStyle& style = ImGui::GetStyle();
-    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
-    {
-        style.WindowRounding = 8.0f;
-        style.Colors[ImGuiCol_WindowBg].w = 1.0f; // Ensure solid background opacity
-    }
+    
+    style.WindowRounding = 8.0f;
+    style.Colors[ImGuiCol_WindowBg].w = 1.0f; // Ensure solid background opacity
+    
     style.ScaleAllSizes(main_scale);        // Bake a fixed style scale. (until we have a solution for dynamic style scaling, changing this requires resetting Style + calling this again)
     style.FontScaleDpi = main_scale;        // Set initial font scale. (in docking branch: using io.ConfigDpiScaleFonts=true automatically overrides this for every window depending on the current monitor)
 
@@ -106,16 +113,17 @@ int main(int, char**)
     style.GrabRounding      = 6.0f;  // Rounding of the slider "grabber" handles
     style.TabRounding       = 4.0f;  // Rounding of dock tabs
 
-    // Setup Platform/Renderer backends
+    // 1. Load Fonts FIRST (before Platform/Renderer backends)
+    ImFont* main_font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
+    if (main_font == nullptr) {
+        io.Fonts->AddFontDefault();
+    }
+
+    // 2. Setup Platform/Renderer backends SECOND
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
-    // Load primary font with a crisp baseline size
-    ImFont* main_font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
-    if (main_font == nullptr) {
-        // Fallback if font isn't found
-        io.Fonts->AddFontDefault();
-    }
+    // io.Fonts->Build();
     
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
@@ -172,11 +180,47 @@ int main(int, char**)
         ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
 
         ImGui::Begin("MainWorkspace", nullptr, window_flags);
-        ImGui::PopStyleVar(3); // Clean up layout styles immediately
 
-        // --- YOUR WIZARD STAGES LIVE HERE ---
-        // Everything drawn here now spans naturally across the entire application viewport
-        ImGui::Text("Project Setup");
+        ImGui::PopStyleVar(3);
+
+        // --- CUSTOM TITLE BAR & WINDOW CONTROLS ---
+        // Align controls to the top right of the viewport
+        float button_width = 40.0f;
+        float title_bar_height = 32.0f;
+
+        ImGui::SetCursorPos(ImVec2(ImGui::GetIO().DisplaySize.x - (button_width * 3) - 10.0f, 5.0f));
+
+        // 1. Minimize Button
+        if (ImGui::Button("_", ImVec2(button_width, 22.0f))) {
+            HWND current_hwnd = (HWND)ImGui::GetMainViewport()->PlatformHandle;
+            ::ShowWindow(current_hwnd, SW_MINIMIZE); // Fixed
+        }
+
+        ImGui::SameLine();
+
+        // 2. Maximize / Restore Button
+        if (ImGui::Button("[]", ImVec2(button_width, 22.0f))) {
+            HWND current_hwnd = (HWND)ImGui::GetMainViewport()->PlatformHandle;
+            WINDOWPLACEMENT wp;
+            wp.length = sizeof(WINDOWPLACEMENT);
+            ::GetWindowPlacement(current_hwnd, &wp);
+            if (wp.showCmd == SW_MAXIMIZE)
+                ::ShowWindow(current_hwnd, SW_RESTORE); // Fixed
+            else
+                ::ShowWindow(current_hwnd, SW_MAXIMIZE); // Fixed
+        }
+
+        ImGui::SameLine();
+
+        // 3. Close Button (Applies custom hover styling for a clean look)
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.1f, 0.1f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.0f, 0.0f, 1.0f));
+        if (ImGui::Button("X", ImVec2(button_width, 22.0f))) {
+            ::PostQuitMessage(0); // Safely trigger application exit
+        }
+        ImGui::PopStyleColor(2);
+
+        ImGui::Spacing();
         ImGui::Separator();
 
         // --- STAGE 0: MAIN MENU ---
@@ -247,17 +291,26 @@ int main(int, char**)
             // 1. Input Field - Tracks if the user modified the text
             if (ImGui::InputText("Folder Path", folder_path, IM_ARRAYSIZE(folder_path)))
             {
-                // Path changed! Run validation
-                fs::path p(folder_path);
-                
-                if (fs::exists(p) && fs::is_directory(p))
+                if (strlen(folder_path) > 0) 
                 {
-                    // Check for key files/folders that prove it's a real HackerSM64 repo
-                    bool has_makefile = fs::exists(p / "Makefile");
-                    bool has_src      = fs::exists(p / "src");
-                    bool has_actors   = fs::exists(p / "actors");
-
-                    is_valid_dir = has_makefile && has_src && has_actors;
+                    fs::path p(folder_path);
+                    if (fs::exists(p) && fs::is_directory(p))
+                    {
+                        bool has_makefile = fs::exists(p / "Makefile");
+                        bool has_src      = fs::exists(p / "src");
+                        bool has_actors   = fs::exists(p / "actors");
+                        bool has_config    = fs::exists(p / "include/config");
+                        bool has_asm     = fs::exists(p / "asm");
+                        bool has_assets   = fs::exists(p / "assets");
+                        bool has_levels   = fs::exists(p / "levels");
+                        bool has_textures = fs::exists(p / "textures");
+                        bool has_build    = fs::exists(p / "build");
+                        is_valid_dir = has_makefile && has_src && has_actors && has_config && has_asm && has_assets && has_levels && has_textures && has_build;
+                    }
+                    else
+                    {
+                        is_valid_dir = false;
+                    }
                 }
                 else
                 {
@@ -274,7 +327,7 @@ int main(int, char**)
                 }
                 else
                 {
-                    ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "✗ Invalid directory. Missing Makefile, src, or actors folder.");
+                    ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "✗ Invalid directory. Please select a valid HackerSM64 folder.");
                 }
             }
             else
@@ -310,7 +363,8 @@ int main(int, char**)
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+        // UPDATE THIS CONDITION BLOCK:
+        if ((ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0)
         {
             ImGui::UpdatePlatformWindows();
             ImGui::RenderPlatformWindowsDefault();
@@ -338,17 +392,23 @@ int main(int, char**)
 
 bool CreateDeviceD3D(HWND hWnd)
 {
-    // Setup swap chain
-    // This is a basic setup. Optimally could use e.g. DXGI_SWAP_EFFECT_FLIP_DISCARD and handle fullscreen mode differently. See #8979 for suggestions.
+    RECT rect;
+    ::GetClientRect(hWnd, &rect);
+    UINT width = rect.right - rect.left;
+    UINT height = rect.bottom - rect.top;
+
+    if (width == 0)  width = 1280;
+    if (height == 0) height = 800;
+
     DXGI_SWAP_CHAIN_DESC sd;
     ZeroMemory(&sd, sizeof(sd));
     sd.BufferCount = 3;
-    sd.BufferDesc.Width = 0;
-    sd.BufferDesc.Height = 0;
+    sd.BufferDesc.Width = width;
+    sd.BufferDesc.Height = height;
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.BufferDesc.RefreshRate.Numerator = 60;
     sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.Flags = 0;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = hWnd;
     sd.SampleDesc.Count = 1;
@@ -357,14 +417,21 @@ bool CreateDeviceD3D(HWND hWnd)
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     UINT createDeviceFlags = 0;
-    //createDeviceFlags |= D3D11_CREATE_DEVICE_DEBUG;
+    createDeviceFlags |= D3D11_CREATE_DEVICE_DEBUG;
     D3D_FEATURE_LEVEL featureLevel;
     const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
     HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    
     if (res == DXGI_ERROR_UNSUPPORTED) // Try high-performance WARP software driver if hardware is not available.
         res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
     if (res != S_OK)
+    {
+        char errorMsg[256];
+        sprintf_s(errorMsg, "D3D11CreateDeviceAndSwapChain failed.\nHRESULT Error Code: 0x%08lX\n\nIf the code is 0x887A002D, your system is missing Windows Graphics Tools.", res);
+        
+        ::MessageBoxA(nullptr, errorMsg, "DirectX Initialization Fatal Error", MB_OK | MB_ICONERROR);
         return false;
+    }
 
     CreateRenderTarget();
     return true;
@@ -406,16 +473,48 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     switch (msg)
     {
+    case WM_NCCALCSIZE:
+        if (wParam == TRUE) return 0; 
+        break;
+    
+    case WM_NCHITTEST: {
+        POINT pt = { LOWORD(lParam), HIWORD(lParam) };
+        ::ScreenToClient(hWnd, &pt);
+
+        // Get the current width of the host window
+        RECT rect;
+        ::GetClientRect(hWnd, &rect);
+        float window_width = (float)(rect.right - rect.left);
+
+        // Define the exact width of your button cluster area (3 buttons * 40px + padding)
+        float button_zone_width = 140.0f; 
+
+        // If the mouse is in the top header area...
+        if (pt.y < 40) 
+        {
+            // ...but it's over on the right side where the buttons live:
+            if (pt.x > (window_width - button_zone_width))
+            {
+                return HTCLIENT; // Tell Windows: "Treat this as a normal interactive button zone, don't drag!"
+            }
+            
+            return HTCAPTION; // Otherwise, treat it as a draggable title bar
+        }
+        return HTCLIENT;
+    }
+
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED)
             return 0;
-        g_ResizeWidth = (UINT)LOWORD(lParam); // Queue resize
+        g_ResizeWidth = (UINT)LOWORD(lParam); 
         g_ResizeHeight = (UINT)HIWORD(lParam);
         return 0;
+
     case WM_SYSCOMMAND:
         if ((wParam & 0xfff0) == SC_KEYMENU) // Disable ALT application menu
             return 0;
         break;
+
     case WM_DESTROY:
         ::PostQuitMessage(0);
         return 0;
