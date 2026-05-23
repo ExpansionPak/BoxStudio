@@ -11,7 +11,7 @@ if you happen to have an actual N64, you can use a flashcart like [SummerCart64]
 
 > [!WARNING]
 > This project is still in early development, so features are going to be missing.<br>
-> Documentation is also still a work in progress.
+> Documentation is also still a work in progress.<br>
 > "Good things take time, Better things take a little longer." — [Sanhita Baruah](https://www.goodreads.com/quotes/11383943-good-things-take-time-better-things-take-a-little-longer)
 
 ## Credits & License

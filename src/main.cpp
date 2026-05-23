@@ -1,16 +1,10 @@
-// Dear ImGui: standalone example application for Windows API + DirectX 11
-
-// Learn about Dear ImGui:
-// - FAQ                  https://dearimgui.com/faq
-// - Getting Started      https://dearimgui.com/getting-started
-// - Documentation        https://dearimgui.com/docs (same as your local docs/ folder).
-// - Introduction, links and more at the top of imgui.cpp
-
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include <d3d11.h>
 #include <tchar.h>
+#include <filesystem>
+namespace fs = std::filesystem;
 
 // Data
 static ID3D11Device*            g_pd3dDevice = nullptr;
@@ -27,6 +21,23 @@ void CreateRenderTarget();
 void CleanupRenderTarget();
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
+enum SetupStage {
+    STAGE_MAIN_MENU,
+    STAGE_NAME_PROJECT,
+    STAGE_CHOOSE_GAME,
+    STAGE_CHOOSE_DECOMP,
+    STAGE_SET_DIRECTORY,
+    STAGE_COMPLETE
+};
+
+SetupStage current_stage = STAGE_MAIN_MENU;
+
+// Variables to store the user's choices
+int selected_game = -1;   // -1 = none, 0 = Super Mario 64
+int selected_decomp = -1; // -1 = none, 0 = HackerSM64
+char folder_path[512] = ""; 
+bool is_valid_dir = false;
+
 // Main code
 int main(int, char**)
 {
@@ -34,10 +45,18 @@ int main(int, char**)
     ImGui_ImplWin32_EnableDpiAwareness();
     float main_scale = ImGui_ImplWin32_GetDpiScaleForMonitor(::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
 
-    // Create application window
-    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"ImGui Example", nullptr };
+    // Create application window with borderless sizing flags
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"ImGui Project", nullptr };
     ::RegisterClassExW(&wc);
-    HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"Dear ImGui DirectX11 Example", WS_OVERLAPPEDWINDOW, 100, 100, (int)(1280 * main_scale), (int)(800 * main_scale), nullptr, nullptr, wc.hInstance, nullptr);
+
+    HWND hwnd = ::CreateWindowW(
+        wc.lpszClassName, 
+        L"Project Launcher", 
+        WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX, // Removes classic title bar
+        100, 100, 
+        (int)(1280 * main_scale), (int)(800 * main_scale), 
+        nullptr, nullptr, wc.hInstance, nullptr
+    );
 
     // Initialize Direct3D
     if (!CreateDeviceD3D(hwnd))
@@ -54,48 +73,50 @@ int main(int, char**)
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    ImGuiIO& io = ImGui::GetIO();
+
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;           // Enable Docking
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;         // Enable Multi-Viewport / Platform Windows
+    io.ConfigFlags |= ImGuiConfigFlags_DpiEnableScaleFonts;     // Automatically scales fonts per-viewport
+    io.ConfigFlags |= ImGuiConfigFlags_DpiEnableScaleViewports; // Scales the UI windows based on monitor DPIs
+
+    io.IniFilename = nullptr; // <--- Disables layout saving entirely
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
-    //ImGui::StyleColorsLight();
 
     // Setup scaling
     ImGuiStyle& style = ImGui::GetStyle();
+    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+    {
+        style.WindowRounding = 8.0f;
+        style.Colors[ImGuiCol_WindowBg].w = 1.0f; // Ensure solid background opacity
+    }
     style.ScaleAllSizes(main_scale);        // Bake a fixed style scale. (until we have a solution for dynamic style scaling, changing this requires resetting Style + calling this again)
     style.FontScaleDpi = main_scale;        // Set initial font scale. (in docking branch: using io.ConfigDpiScaleFonts=true automatically overrides this for every window depending on the current monitor)
 
-    style.WindowRounding = 8.0f;  // Roundness of the main window corners
-    style.FrameRounding  = 6.0f;  // Roundness of buttons, checkboxes, inputs
-    style.GrabRounding   = 6.0f;  // Roundness of slider knobs
+    // Adjust window and panel borders
+    style.WindowRounding    = 8.0f;  // Rounding of main windows
+    style.ChildRounding     = 6.0f;  // Rounding of child windows
+    style.FrameRounding     = 6.0f;  // Rounding of buttons, sliders, input boxes
+    style.PopupRounding     = 6.0f;  // Rounding of context menus and tooltips
+    style.ScrollbarRounding = 12.0f; // Rounding of scrollbars
+    style.GrabRounding      = 6.0f;  // Rounding of the slider "grabber" handles
+    style.TabRounding       = 4.0f;  // Rounding of dock tabs
 
     // Setup Platform/Renderer backends
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
-    // Load Fonts
-    // - If fonts are not explicitly loaded, Dear ImGui will select an embedded font: either AddFontDefaultVector() or AddFontDefaultBitmap().
-    //   This selection is based on (style.FontSizeBase * style.FontScaleMain * style.FontScaleDpi) reaching a small threshold.
-    // - You can load multiple fonts and use ImGui::PushFont()/PopFont() to select them.
-    // - If a file cannot be loaded, AddFont functions will return a nullptr. Please handle those errors in your code (e.g. use an assertion, display an error and quit).
-    // - Read 'docs/FONTS.md' for more instructions and details.
-    // - Use '#define IMGUI_ENABLE_FREETYPE' in your imconfig file to use FreeType for higher quality font rendering.
-    // - Remember that in C/C++ if you want to include a backslash \ in a string literal you need to write a double backslash \\ !
-    //style.FontSizeBase = 20.0f;
-    //io.Fonts->AddFontDefaultVector();
-    //io.Fonts->AddFontDefaultBitmap();
-    io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf");
-    //io.Fonts->AddFontFromFileTTF("../../misc/fonts/DroidSans.ttf");
-    //io.Fonts->AddFontFromFileTTF("../../misc/fonts/Roboto-Medium.ttf");
-    //io.Fonts->AddFontFromFileTTF("../../misc/fonts/Cousine-Regular.ttf");
-    //ImFont* font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\ArialUni.ttf");
-    //IM_ASSERT(font != nullptr);
-
-    // Our state
-    bool show_demo_window = true;
-    bool show_another_window = false;
+    // Load primary font with a crisp baseline size
+    ImFont* main_font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
+    if (main_font == nullptr) {
+        // Fallback if font isn't found
+        io.Fonts->AddFontDefault();
+    }
+    
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
     // Main loop
@@ -137,13 +158,149 @@ int main(int, char**)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // 1. Create the window with the requested title
-        ImGui::Begin("BoxStudio");
+        // Viewport handling (if we have multiple monitors, we want to make sure the main viewport is on the primary monitor where the mouse cursor starts)
+        ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
+        ImGui::SetNextWindowViewport(viewport->ID);
 
-        // 2. Add your placeholder text widget
-        ImGui::Text("Placeholder");
+        // Force flat layout padding properties
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0f, 20.0f)); // Generous internal margins
 
-        // 3. Always close the window at the end
+        ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
+
+        ImGui::Begin("MainWorkspace", nullptr, window_flags);
+        ImGui::PopStyleVar(3); // Clean up layout styles immediately
+
+        // --- YOUR WIZARD STAGES LIVE HERE ---
+        // Everything drawn here now spans naturally across the entire application viewport
+        ImGui::Text("Project Setup");
+        ImGui::Separator();
+
+        // --- STAGE 0: MAIN MENU ---
+        if (current_stage == STAGE_MAIN_MENU)
+        {
+            ImGui::Text("Hello, world!");
+
+            if (ImGui::Button("Create Project")) {
+                current_stage = STAGE_NAME_PROJECT; // Move to next stage
+            }
+        }
+
+        // --- STAGE 0: NAME PROJECT (placeholder) ---
+        else if (current_stage == STAGE_NAME_PROJECT)
+        {
+            ImGui::Text("Project naming is not implemented yet. Click next to continue.");
+            ImGui::Separator();
+
+            if (ImGui::Button("Next >>")) {
+                current_stage = STAGE_CHOOSE_GAME;
+            }
+        }
+
+        // --- STAGE 1: CHOOSE GAME ---
+        else if (current_stage == STAGE_CHOOSE_GAME)
+        {
+            ImGui::Text("Which game?");
+            ImGui::Separator();
+
+            if (ImGui::Selectable("Super Mario 64", selected_game == 0)) {
+                selected_game = 0;
+            }
+            // Future games can go here as extra Selectables
+
+            ImGui::Spacing();
+            // Only allow next if a game is selected
+            ImGui::BeginDisabled(selected_game == -1);
+            if (ImGui::Button("Next >>")) {
+                current_stage = STAGE_CHOOSE_DECOMP;
+            }
+            ImGui::EndDisabled();
+        }
+
+        // --- STAGE 2: CHOOSE DECOMP BASE ---
+        else if (current_stage == STAGE_CHOOSE_DECOMP)
+        {
+            ImGui::Text("Choose a decomp base:");
+            ImGui::Separator();
+
+            if (ImGui::Selectable("HackerSM64", selected_decomp == 0)) {
+                selected_decomp = 0;
+            }
+
+            ImGui::Spacing();
+            ImGui::BeginDisabled(selected_decomp == -1);
+            if (ImGui::Button("Next >>")) {
+                current_stage = STAGE_SET_DIRECTORY;
+            }
+            ImGui::EndDisabled();
+        }
+
+        // --- STAGE 3: SET DIRECTORY ---
+        else if (current_stage == STAGE_SET_DIRECTORY)
+        {
+            ImGui::Text("Set the directory to your HackerSM64 folder:");
+            ImGui::Separator();
+
+            // 1. Input Field - Tracks if the user modified the text
+            if (ImGui::InputText("Folder Path", folder_path, IM_ARRAYSIZE(folder_path)))
+            {
+                // Path changed! Run validation
+                fs::path p(folder_path);
+                
+                if (fs::exists(p) && fs::is_directory(p))
+                {
+                    // Check for key files/folders that prove it's a real HackerSM64 repo
+                    bool has_makefile = fs::exists(p / "Makefile");
+                    bool has_src      = fs::exists(p / "src");
+                    bool has_actors   = fs::exists(p / "actors");
+
+                    is_valid_dir = has_makefile && has_src && has_actors;
+                }
+                else
+                {
+                    is_valid_dir = false;
+                }
+            }
+
+            // 2. Feedback Text (Inline validation status)
+            if (strlen(folder_path) > 0)
+            {
+                if (is_valid_dir)
+                {
+                    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "✓ Valid HackerSM64 directory structure detected.");
+                }
+                else
+                {
+                    ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "✗ Invalid directory. Missing Makefile, src, or actors folder.");
+                }
+            }
+            else
+            {
+                ImGui::Text("Please enter a path.");
+            }
+
+            ImGui::Spacing();
+            
+            // 3. Action Buttons
+            // Disable the finish button unless the validation checks pass successfully
+            ImGui::BeginDisabled(!is_valid_dir);
+            if (ImGui::Button("Finish")) {
+                current_stage = STAGE_COMPLETE;
+            }
+            ImGui::EndDisabled();
+        }
+
+        // --- STAGE 4: SETUP COMPLETE ---
+        else if (current_stage == STAGE_COMPLETE)
+        {
+            ImGui::Text("Setup Complete!");
+            ImGui::Text("Target: Super Mario 64 (HackerSM64)");
+            ImGui::Text("Path: %s", folder_path);
+        }
+
         ImGui::End();
 
         // Rendering
@@ -152,6 +309,12 @@ int main(int, char**)
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+        {
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+        }
 
         // Present
         HRESULT hr = g_pSwapChain->Present(1, 0);   // Present with vsync
@@ -179,7 +342,7 @@ bool CreateDeviceD3D(HWND hWnd)
     // This is a basic setup. Optimally could use e.g. DXGI_SWAP_EFFECT_FLIP_DISCARD and handle fullscreen mode differently. See #8979 for suggestions.
     DXGI_SWAP_CHAIN_DESC sd;
     ZeroMemory(&sd, sizeof(sd));
-    sd.BufferCount = 2;
+    sd.BufferCount = 3;
     sd.BufferDesc.Width = 0;
     sd.BufferDesc.Height = 0;
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -191,7 +354,7 @@ bool CreateDeviceD3D(HWND hWnd)
     sd.SampleDesc.Count = 1;
     sd.SampleDesc.Quality = 0;
     sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     UINT createDeviceFlags = 0;
     //createDeviceFlags |= D3D11_CREATE_DEVICE_DEBUG;
