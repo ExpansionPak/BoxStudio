@@ -105,6 +105,13 @@ struct MeshTriangle {
     int textureWidth = 32;
     int textureHeight = 32;
     bool textureClamp = false;
+    bool textureClampS = false;
+    bool textureClampT = false;
+    bool textureMirrorS = false;
+    bool textureMirrorT = false;
+    float textureScaleS = 1.0f;
+    float textureScaleT = 1.0f;
+    bool textureGen = false;
     ImU32 color = IM_COL32(110, 150, 120, 220);
 };
 
@@ -135,6 +142,14 @@ struct ViewportVertex {
     float x, y, z;
     float u, v;
     float r, g, b, a;
+};
+
+struct ViewportMeshBatch {
+    std::vector<ViewportVertex> vertices;
+    std::string textureKey;
+    bool textured = false;
+    bool clamp = false;
+    bool water = false;
 };
 
 struct ViewportCameraConstants {
@@ -217,6 +232,9 @@ struct AppState {
     LevelMesh mesh;
     std::vector<TextureAsset> textures;
     std::unordered_map<std::string, GpuTexture> textureCache;
+    std::vector<ViewportMeshBatch> viewportBatches;
+    LevelViewMode cachedViewMode = LevelViewMode::GeometryOnly;
+    bool viewportBatchesDirty = true;
     int textureTrianglesDrawn = 0;
     int textureTrianglesMissing = 0;
     int selectedLevel = -1;
@@ -817,6 +835,24 @@ static int IntOrZero(const std::string& token)
     }
 }
 
+static int SignedByte(int value)
+{
+    value &= 0xff;
+    return value >= 128 ? value - 256 : value;
+}
+
+static float TextureScaleOrOne(const std::string& token)
+{
+    const int value = IntOrZero(token);
+    if (value <= 0 || value >= 0xffff) return 1.0f;
+    return std::clamp(static_cast<float>(value) / 65535.0f, 1.0f / 1024.0f, 1.0f);
+}
+
+static bool HasTextureFlag(const std::string& token, const char* flag)
+{
+    return token.find(flag) != std::string::npos;
+}
+
 static ImU32 TextureColor(const std::string& texture, ImU32 fallback)
 {
     if (texture.empty()) return fallback;
@@ -834,6 +870,7 @@ static ImU32 TextureColor(const std::string& texture, ImU32 fallback)
 struct RenderVertex {
     Vec3 pos;
     ImVec2 uv = ImVec2(0.0f, 0.0f);
+    Vec3 normal = { 0.0f, 1.0f, 0.0f };
     ImU32 color = IM_COL32(160, 160, 160, 230);
 };
 
@@ -905,12 +942,32 @@ static std::unordered_map<std::string, fs::path> CollectGeoLayoutFiles(const Lev
     return result;
 }
 
-static std::vector<std::string> CollectDisplayListsFromGeoFile(const fs::path& geoFile)
+static std::string ExtractGeoLayoutBody(const std::string& text, const std::string& layoutName)
+{
+    const std::string needle = "const GeoLayout " + layoutName;
+    size_t pos = text.find(needle);
+    if (pos == std::string::npos) return {};
+    pos = text.find('{', pos);
+    if (pos == std::string::npos) return {};
+    int depth = 0;
+    for (size_t i = pos; i < text.size(); ++i) {
+        if (text[i] == '{') ++depth;
+        if (text[i] == '}') {
+            --depth;
+            if (depth == 0) return text.substr(pos + 1, i - pos - 1);
+        }
+    }
+    return {};
+}
+
+static std::vector<std::string> CollectDisplayListsFromGeoFile(const fs::path& geoFile, const std::string& layoutName)
 {
     std::vector<std::string> roots;
     const std::string text = StripCComments(Slurp(geoFile));
+    const std::string body = ExtractGeoLayoutBody(text, layoutName);
+    const std::string& searchText = body.empty() ? text : body;
     std::regex pattern(R"(GEO_DISPLAY_LIST\s*\(\s*[A-Za-z0-9_]+,\s*([A-Za-z0-9_]+)\s*\)|GEO_ANIMATED_PART\s*\(\s*[A-Za-z0-9_]+,\s*[-+]?\d+,\s*[-+]?\d+,\s*[-+]?\d+,\s*([A-Za-z0-9_]+)\s*\))");
-    for (auto it = std::sregex_iterator(text.begin(), text.end(), pattern), end = std::sregex_iterator(); it != end; ++it) {
+    for (auto it = std::sregex_iterator(searchText.begin(), searchText.end(), pattern), end = std::sregex_iterator(); it != end; ++it) {
         const std::string root = (*it)[1].matched ? (*it)[1].str() : (*it)[2].str();
         if (root != "NULL") roots.push_back(root);
     }
@@ -979,7 +1036,7 @@ static std::unordered_map<std::string, std::vector<RenderInstance>> CollectSpeci
             const fs::path modelFile = geoFile->second.parent_path() / "model.inc.c";
             if (!fs::exists(modelFile, ec)) continue;
             RenderInstance instance;
-            instance.roots = CollectDisplayListsFromGeoFile(geoFile->second);
+            instance.roots = CollectDisplayListsFromGeoFile(geoFile->second, geoName->second);
             instance.translation = {
                 static_cast<float>(IntOrZero((*it)[2].str())),
                 static_cast<float>(IntOrZero((*it)[3].str())),
@@ -1092,6 +1149,7 @@ static LevelMesh LoadRenderMesh(const LevelInfo& level)
                 vertices.push_back({
                     { static_cast<float>(IntOrZero((*vit)[1].str())), static_cast<float>(IntOrZero((*vit)[2].str())), static_cast<float>(IntOrZero((*vit)[3].str())) },
                     ImVec2(static_cast<float>(IntOrZero((*vit)[4].str())) / 32.0f, static_cast<float>(IntOrZero((*vit)[5].str())) / 32.0f),
+                    { static_cast<float>(SignedByte(r)) / 127.0f, static_cast<float>(SignedByte(g)) / 127.0f, static_cast<float>(SignedByte(b)) / 127.0f },
                     IM_COL32(r, g, b, std::max(190, a))
                 });
             }
@@ -1122,31 +1180,72 @@ static LevelMesh LoadRenderMesh(const LevelInfo& level)
         int currentTextureWidth = 32;
         int currentTextureHeight = 32;
         bool currentTextureClamp = false;
+        bool currentTextureClampS = false;
+        bool currentTextureClampT = false;
+        bool currentTextureMirrorS = false;
+        bool currentTextureMirrorT = false;
+        float currentTextureScaleS = 1.0f;
+        float currentTextureScaleT = 1.0f;
+        bool currentTextureEnabled = true;
+        bool currentTextureGen = false;
+        std::string currentVertexArray;
         const RenderInstance* activeInstance = nullptr;
-        std::regex commandPattern(R"(gsDPSetTextureImage\s*\(\s*([A-Za-z0-9_]+)\s*,\s*([A-Za-z0-9_]+)\s*,[^,]+,\s*([A-Za-z0-9_]+)\s*\)|gsDPLoadBlock\s*\([^,]+,[^,]+,[^,]+,\s*(\d+)\s*\*\s*(\d+)\s*-\s*1|gsDPSetTile\s*\(([^)]*)\)|gsSPVertex\s*\(\s*([A-Za-z0-9_]+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)|gsSP1Triangle\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)|gsSP2Triangles\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*0x[0-9a-fA-F]+,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)|gsSP(?:DisplayList|BranchList)\s*\(\s*([A-Za-z0-9_]+)\s*\))");
-        auto emitTri = [&](int ia, int ib, int ic) {
-            if (ia < 0 || ia >= 64 || ib < 0 || ib >= 64 || ic < 0 || ic >= 64) return;
+        std::regex commandPattern(R"(gsDPSetTextureImage\s*\(\s*([A-Za-z0-9_]+)\s*,\s*([A-Za-z0-9_]+)\s*,[^,]+,\s*([A-Za-z0-9_]+)\s*\)|gsDPLoadBlock\s*\([^,]+,[^,]+,[^,]+,\s*(\d+)\s*\*\s*(\d+)\s*-\s*1|gsDPSetTile\s*\(([^)]*)\)|gsDPSetTileSize\s*\([^,]+,[^,]+,[^,]+,\s*\(?\s*(\d+)\s*-\s*1\s*\)?\s*<<\s*G_TEXTURE_IMAGE_FRAC\s*,\s*\(?\s*(\d+)\s*-\s*1\s*\)?\s*<<\s*G_TEXTURE_IMAGE_FRAC\s*\)|gsSPVertex\s*\(\s*([A-Za-z0-9_]+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)|gsSP1Triangle\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)|gsSP2Triangles\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*0x[0-9a-fA-F]+,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)|gsSP(?:DisplayList|BranchList)\s*\(\s*([A-Za-z0-9_]+)\s*\)|gsDPLoadTextureBlock\s*\(\s*([A-Za-z0-9_]+)\s*,\s*([A-Za-z0-9_]+)\s*,\s*([A-Za-z0-9_]+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*[^,]+,\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)|gsSPTexture\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,[^,]+,[^,]+,\s*(G_ON|G_OFF)\s*\)|gsSPSetGeometryMode\s*\(([^)]*)\)|gsSPClearGeometryMode\s*\(([^)]*)\))");
+        auto emitTriangleVertices = [&](const RenderVertex& va, const RenderVertex& vb, const RenderVertex& vc) {
             if (activeInstance == nullptr) return;
             const int base = static_cast<int>(mesh.vertices.size());
-            mesh.vertices.push_back(TransformRenderPoint(slots[ia].pos, *activeInstance));
-            mesh.vertices.push_back(TransformRenderPoint(slots[ib].pos, *activeInstance));
-            mesh.vertices.push_back(TransformRenderPoint(slots[ic].pos, *activeInstance));
+            mesh.vertices.push_back(TransformRenderPoint(va.pos, *activeInstance));
+            mesh.vertices.push_back(TransformRenderPoint(vb.pos, *activeInstance));
+            mesh.vertices.push_back(TransformRenderPoint(vc.pos, *activeInstance));
+            auto textureGenUv = [&](const RenderVertex& vertex) {
+                return ImVec2(
+                    (vertex.normal.x * 0.5f + 0.5f) * static_cast<float>(std::max(1, currentTextureWidth)),
+                    (0.5f - vertex.normal.y * 0.5f) * static_cast<float>(std::max(1, currentTextureHeight)));
+            };
             MeshTriangle tri;
             tri.a = base;
             tri.b = base + 1;
             tri.c = base + 2;
-            tri.uva = slots[ia].uv;
-            tri.uvb = slots[ib].uv;
-            tri.uvc = slots[ic].uv;
-            tri.texture = currentTexture;
+            tri.uva = currentTextureGen ? textureGenUv(va) : va.uv;
+            tri.uvb = currentTextureGen ? textureGenUv(vb) : vb.uv;
+            tri.uvc = currentTextureGen ? textureGenUv(vc) : vc.uv;
+            tri.texture = currentTextureEnabled ? currentTexture : "";
             tri.textureFormat = currentTextureFormat;
             tri.textureSize = currentTextureSize;
             tri.textureWidth = currentTextureWidth;
             tri.textureHeight = currentTextureHeight;
             tri.textureClamp = currentTextureClamp;
+            tri.textureClampS = currentTextureClampS;
+            tri.textureClampT = currentTextureClampT;
+            tri.textureMirrorS = currentTextureMirrorS;
+            tri.textureMirrorT = currentTextureMirrorT;
+            tri.textureScaleS = currentTextureGen ? 1.0f : currentTextureScaleS;
+            tri.textureScaleT = currentTextureGen ? 1.0f : currentTextureScaleT;
+            tri.textureGen = currentTextureGen;
             tri.surface = "RENDER";
-            tri.color = AverageColor(slots[ia].color, slots[ib].color, slots[ic].color);
+            tri.color = AverageColor(va.color, vb.color, vc.color);
             mesh.triangles.push_back(tri);
+        };
+        auto emitTri = [&](int ia, int ib, int ic) {
+            if (ia < 0 || ia >= 64 || ib < 0 || ib >= 64 || ic < 0 || ic >= 64) return;
+            if (activeInstance == nullptr) return;
+            if (currentVertexArray == "tree_seg3_vertex_bubbly_left_side" && ia == 0 && ib == 1 && ic == 2) {
+                RenderVertex topLeft = slots[0];
+                topLeft.pos.y = slots[2].pos.y;
+                topLeft.uv.y = slots[2].uv.y;
+                emitTriangleVertices(slots[0], slots[1], slots[2]);
+                emitTriangleVertices(slots[0], slots[2], topLeft);
+                return;
+            }
+            if (currentVertexArray == "tree_seg3_vertex_bubbly_right_side" && ia == 0 && ib == 1 && ic == 2) {
+                RenderVertex topRight = slots[1];
+                topRight.pos.y = slots[2].pos.y;
+                topRight.uv.y = slots[2].uv.y;
+                emitTriangleVertices(slots[0], slots[1], topRight);
+                emitTriangleVertices(slots[0], topRight, slots[2]);
+                return;
+            }
+            emitTriangleVertices(slots[ia], slots[ib], slots[ic]);
         };
 
         std::vector<std::string> stack;
@@ -1164,24 +1263,57 @@ static LevelMesh LoadRenderMesh(const LevelInfo& level)
                     currentTextureWidth = std::max(1, IntOrZero((*it)[4].str()));
                     currentTextureHeight = std::max(1, IntOrZero((*it)[5].str()));
                 } else if ((*it)[6].matched) {
-                    const std::string tile = (*it)[6].str();
-                    currentTextureClamp = tile.find("G_TX_CLAMP") != std::string::npos;
+                    const std::vector<std::string> args = SplitArgs((*it)[6].str());
+                    if (args.size() >= 12) {
+                        const std::string& tMode = args[6];
+                        const std::string& sMode = args[9];
+                        currentTextureClampS = HasTextureFlag(sMode, "G_TX_CLAMP");
+                        currentTextureClampT = HasTextureFlag(tMode, "G_TX_CLAMP");
+                        currentTextureMirrorS = HasTextureFlag(sMode, "G_TX_MIRROR");
+                        currentTextureMirrorT = HasTextureFlag(tMode, "G_TX_MIRROR");
+                        currentTextureClamp = currentTextureClampS || currentTextureClampT;
+                    }
                 } else if ((*it)[7].matched) {
-                    const std::string arrayName = (*it)[7].str();
-                    const int count = IntOrZero((*it)[8].str());
-                    const int start = IntOrZero((*it)[9].str());
+                    currentTextureWidth = std::max(1, IntOrZero((*it)[7].str()));
+                    currentTextureHeight = std::max(1, IntOrZero((*it)[8].str()));
+                } else if ((*it)[9].matched) {
+                    const std::string arrayName = (*it)[9].str();
+                    const int count = IntOrZero((*it)[10].str());
+                    const int start = IntOrZero((*it)[11].str());
                     auto found = arrays.find(arrayName);
                     if (found == arrays.end()) continue;
+                    currentVertexArray = arrayName;
                     for (int i = 0; i < count && i < static_cast<int>(found->second.size()) && start + i < 64; ++i) {
                         slots[start + i] = found->second[i];
                     }
-                } else if ((*it)[10].matched) {
-                    emitTri(IntOrZero((*it)[10].str()), IntOrZero((*it)[11].str()), IntOrZero((*it)[12].str()));
-                } else if ((*it)[13].matched) {
-                    emitTri(IntOrZero((*it)[13].str()), IntOrZero((*it)[14].str()), IntOrZero((*it)[15].str()));
-                    emitTri(IntOrZero((*it)[16].str()), IntOrZero((*it)[17].str()), IntOrZero((*it)[18].str()));
-                } else if ((*it)[19].matched) {
-                    runBlockRef((*it)[19].str(), runBlockRef);
+                } else if ((*it)[12].matched) {
+                    emitTri(IntOrZero((*it)[12].str()), IntOrZero((*it)[13].str()), IntOrZero((*it)[14].str()));
+                } else if ((*it)[15].matched) {
+                    emitTri(IntOrZero((*it)[15].str()), IntOrZero((*it)[16].str()), IntOrZero((*it)[17].str()));
+                    emitTri(IntOrZero((*it)[18].str()), IntOrZero((*it)[19].str()), IntOrZero((*it)[20].str()));
+                } else if ((*it)[21].matched) {
+                    runBlockRef((*it)[21].str(), runBlockRef);
+                } else if ((*it)[22].matched) {
+                    currentTexture = (*it)[22].str();
+                    currentTextureFormat = (*it)[23].str();
+                    currentTextureSize = (*it)[24].str();
+                    currentTextureWidth = std::max(1, IntOrZero((*it)[25].str()));
+                    currentTextureHeight = std::max(1, IntOrZero((*it)[26].str()));
+                    const std::string sMode = (*it)[27].str();
+                    const std::string tMode = (*it)[28].str();
+                    currentTextureClampS = HasTextureFlag(sMode, "G_TX_CLAMP");
+                    currentTextureClampT = HasTextureFlag(tMode, "G_TX_CLAMP");
+                    currentTextureMirrorS = HasTextureFlag(sMode, "G_TX_MIRROR");
+                    currentTextureMirrorT = HasTextureFlag(tMode, "G_TX_MIRROR");
+                    currentTextureClamp = currentTextureClampS || currentTextureClampT;
+                } else if ((*it)[33].matched) {
+                    currentTextureScaleS = TextureScaleOrOne((*it)[33].str());
+                    currentTextureScaleT = TextureScaleOrOne((*it)[34].str());
+                    currentTextureEnabled = (*it)[35].str() == "G_ON";
+                } else if ((*it)[36].matched) {
+                    if (HasTextureFlag((*it)[36].str(), "G_TEXTURE_GEN")) currentTextureGen = true;
+                } else if ((*it)[37].matched) {
+                    if (HasTextureFlag((*it)[37].str(), "G_TEXTURE_GEN")) currentTextureGen = false;
                 }
             }
             stack.pop_back();
@@ -1195,6 +1327,14 @@ static LevelMesh LoadRenderMesh(const LevelInfo& level)
             currentTextureWidth = 32;
             currentTextureHeight = 32;
             currentTextureClamp = false;
+            currentTextureClampS = false;
+            currentTextureClampT = false;
+            currentTextureMirrorS = false;
+            currentTextureMirrorT = false;
+            currentTextureScaleS = 1.0f;
+            currentTextureScaleT = 1.0f;
+            currentTextureEnabled = true;
+            currentTextureGen = false;
             stack.clear();
             activeInstance = &instance;
             for (const std::string& root : instance.roots) {
@@ -1316,6 +1456,8 @@ static void ReleaseTextureCache(AppState& app)
         }
     }
     app.textureCache.clear();
+    app.viewportBatches.clear();
+    app.viewportBatchesDirty = true;
     app.textureTrianglesDrawn = 0;
     app.textureTrianglesMissing = 0;
 }
@@ -1711,6 +1853,13 @@ static float WrapUv(float value)
     return value;
 }
 
+static float MirrorUv(float value)
+{
+    value = fmodf(value, 2.0f);
+    if (value < 0.0f) value += 2.0f;
+    return value <= 1.0f ? value : 2.0f - value;
+}
+
 static ImVec2 NormalizeUv(const ImVec2& uv, const GpuTexture& texture, bool clamp)
 {
     float u = uv.x / static_cast<float>(std::max(1, texture.width));
@@ -1719,6 +1868,27 @@ static ImVec2 NormalizeUv(const ImVec2& uv, const GpuTexture& texture, bool clam
         const float maxU = 1.0f - (0.5f / static_cast<float>(std::max(1, texture.width)));
         const float maxV = 1.0f - (0.5f / static_cast<float>(std::max(1, texture.height)));
         u = std::clamp(u, 0.0f, maxU);
+        v = std::clamp(v, 0.0f, maxV);
+    }
+    return ImVec2(u, v);
+}
+
+static ImVec2 NormalizeUv(const ImVec2& uv, const GpuTexture& texture, const MeshTriangle& tri)
+{
+    const int width = std::max(1, texture.width);
+    const int height = std::max(1, texture.height);
+    float u = (uv.x * tri.textureScaleS) / static_cast<float>(width);
+    float v = (uv.y * tri.textureScaleT) / static_cast<float>(height);
+
+    if (tri.textureMirrorS) u = MirrorUv(u);
+    if (tri.textureMirrorT) v = MirrorUv(v);
+
+    if (tri.textureClampS) {
+        const float maxU = 1.0f - (0.5f / static_cast<float>(width));
+        u = std::clamp(u, 0.0f, maxU);
+    }
+    if (tri.textureClampT) {
+        const float maxV = 1.0f - (0.5f / static_cast<float>(height));
         v = std::clamp(v, 0.0f, maxV);
     }
     return ImVec2(u, v);
@@ -1797,7 +1967,7 @@ static int DrawTexturedTriangleSubdivided(ImDrawList* draw, const AppState& app,
             LerpUv(tri.uva, tri.uvb, tri.uvc, u0, v0),
             LerpUv(tri.uva, tri.uvb, tri.uvc, u1, v1),
             LerpUv(tri.uva, tri.uvb, tri.uvc, u2, v2),
-            texture, tri.textureClamp, IM_COL32(255, 255, 255, 255));
+            texture, tri.textureClampS || tri.textureClampT, IM_COL32(255, 255, 255, 255));
         ++drawn;
     };
 
@@ -1960,6 +2130,9 @@ static void PollLevelLoad(AppState& app)
         app.mesh = std::move(app.levelLoadJob.mesh);
         app.textures = std::move(app.levelLoadJob.textures);
     }
+    app.viewportBatches.clear();
+    app.viewportBatchesDirty = true;
+    app.cachedViewMode = app.viewMode;
     app.selectedObject = app.objects.empty() ? -1 : 0;
     app.selectedTexture = app.textures.empty() ? -1 : 0;
     app.levelDirty = false;
@@ -2498,54 +2671,55 @@ static bool RenderViewportScene(AppState& app, int width, int height)
     cameraConstants.viewport[3] = 24000.0f;
     UpdateConstantBuffer(g_viewportRenderer.cameraBuffer, &cameraConstants, sizeof(cameraConstants));
 
-    std::vector<ViewportVertex> untextured;
-    std::vector<ViewportVertex> water;
-    struct TextureBatch {
-        std::vector<ViewportVertex> vertices;
-        ID3D11ShaderResourceView* srv = nullptr;
-        bool clamp = false;
-    };
-    std::unordered_map<std::string, TextureBatch> textureBatches;
+    if (app.viewportBatchesDirty || app.cachedViewMode != app.viewMode) {
+        app.viewportBatches.clear();
+        app.cachedViewMode = app.viewMode;
+        std::unordered_map<std::string, size_t> batchByKey;
+        auto getBatch = [&](const std::string& key) -> ViewportMeshBatch& {
+            auto found = batchByKey.find(key);
+            if (found != batchByKey.end()) return app.viewportBatches[found->second];
+            ViewportMeshBatch batch;
+            batchByKey[key] = app.viewportBatches.size();
+            app.viewportBatches.push_back(std::move(batch));
+            return app.viewportBatches.back();
+        };
 
-    for (const MeshTriangle& tri : app.mesh.triangles) {
-        if (tri.a >= static_cast<int>(app.mesh.vertices.size()) || tri.b >= static_cast<int>(app.mesh.vertices.size()) || tri.c >= static_cast<int>(app.mesh.vertices.size())) continue;
-        const bool isWater = tri.surface.find("WATER") != std::string::npos;
-        const bool textured = app.viewMode == LevelViewMode::TextureMode && tri.surface == "RENDER";
-        ImU32 color = SurfaceColor(tri, app);
-        if (app.viewMode == LevelViewMode::TextureMode && tri.surface == "RENDER") color = IM_COL32(255, 255, 255, 255);
-        if (isWater) color = IM_COL32(70, 145, 190, 105);
+        for (const MeshTriangle& tri : app.mesh.triangles) {
+            if (tri.a >= static_cast<int>(app.mesh.vertices.size()) || tri.b >= static_cast<int>(app.mesh.vertices.size()) || tri.c >= static_cast<int>(app.mesh.vertices.size())) continue;
+            const bool isWater = tri.surface.find("WATER") != std::string::npos;
+            const bool textured = app.viewMode == LevelViewMode::TextureMode && tri.surface == "RENDER";
+            ImU32 color = SurfaceColor(tri, app);
+            if (app.viewMode == LevelViewMode::TextureMode && tri.surface == "RENDER") color = IM_COL32(255, 255, 255, 255);
+            if (isWater) color = IM_COL32(70, 145, 190, 105);
 
-        std::vector<ViewportVertex>* target = &untextured;
-        ID3D11ShaderResourceView* textureSrv = nullptr;
-        GpuTexture* gpuTexture = nullptr;
-        if (textured) {
-            gpuTexture = GetGpuTexture(app, tri);
-            if (gpuTexture != nullptr) textureSrv = gpuTexture->srv;
+            GpuTexture* gpuTexture = nullptr;
+            std::string key = isWater ? "__water" : "__flat";
+            if (textured) {
+                gpuTexture = GetGpuTexture(app, tri);
+                if (gpuTexture != nullptr) key = TextureCacheKey(tri);
+            }
+
+            ViewportMeshBatch& batch = getBatch(key);
+            batch.water = isWater;
+            batch.textured = gpuTexture != nullptr && !isWater;
+            batch.clamp = false;
+            if (gpuTexture != nullptr) batch.textureKey = TextureCacheKey(tri);
+
+            ImVec2 uva = tri.uva, uvb = tri.uvb, uvc = tri.uvc;
+            if (gpuTexture != nullptr) {
+                uva = NormalizeUv(tri.uva, *gpuTexture, tri);
+                uvb = NormalizeUv(tri.uvb, *gpuTexture, tri);
+                uvc = NormalizeUv(tri.uvc, *gpuTexture, tri);
+            }
+            batch.vertices.push_back(MakeViewportVertex(app.mesh.vertices[tri.a], uva, color));
+            batch.vertices.push_back(MakeViewportVertex(app.mesh.vertices[tri.b], uvb, color));
+            batch.vertices.push_back(MakeViewportVertex(app.mesh.vertices[tri.c], uvc, color));
         }
-
-        ImVec2 uva = tri.uva, uvb = tri.uvb, uvc = tri.uvc;
-        if (gpuTexture != nullptr) {
-            uva = NormalizeUv(tri.uva, *gpuTexture, tri.textureClamp);
-            uvb = NormalizeUv(tri.uvb, *gpuTexture, tri.textureClamp);
-            uvc = NormalizeUv(tri.uvc, *gpuTexture, tri.textureClamp);
-        }
-
-        if (isWater) {
-            target = &water;
-        } else if (textureSrv != nullptr) {
-            const std::string key = TextureCacheKey(tri);
-            TextureBatch& batch = textureBatches[key];
-            batch.srv = textureSrv;
-            batch.clamp = tri.textureClamp;
-            target = &batch.vertices;
-        }
-        target->push_back(MakeViewportVertex(app.mesh.vertices[tri.a], uva, color));
-        target->push_back(MakeViewportVertex(app.mesh.vertices[tri.b], uvb, color));
-        target->push_back(MakeViewportVertex(app.mesh.vertices[tri.c], uvc, color));
+        app.viewportBatchesDirty = false;
     }
 
-    size_t maxVertices = untextured.size() + water.size();
-    for (const auto& item : textureBatches) maxVertices = std::max(maxVertices, item.second.vertices.size());
+    size_t maxVertices = 0;
+    for (const ViewportMeshBatch& batch : app.viewportBatches) maxVertices = std::max(maxVertices, batch.vertices.size());
     EnsureViewportVertexBuffer(maxVertices);
     g_pd3dDeviceContext->IASetVertexBuffers(0, 1, &g_viewportRenderer.vertexBuffer, &stride, &offset);
 
@@ -2558,20 +2732,29 @@ static bool RenderViewportScene(AppState& app, int width, int height)
     drawConstants.useTexture = 0.0f;
     drawConstants.alphaTest = 0.0f;
     drawConstants.alphaScale = 1.0f;
-    DrawViewportVertices(untextured, g_viewportRenderer.whiteSrv, g_clampSamplerState, drawConstants);
+    for (const ViewportMeshBatch& batch : app.viewportBatches) {
+        if (batch.water || batch.textured) continue;
+        DrawViewportVertices(batch.vertices, g_viewportRenderer.whiteSrv, g_clampSamplerState, drawConstants);
+    }
 
     drawConstants.useTexture = 1.0f;
     drawConstants.alphaTest = 1.0f;
     drawConstants.alphaScale = 1.0f;
-    for (const auto& item : textureBatches) {
-        DrawViewportVertices(item.second.vertices, item.second.srv, item.second.clamp ? g_clampSamplerState : g_wrapSamplerState, drawConstants);
+    for (const ViewportMeshBatch& batch : app.viewportBatches) {
+        if (!batch.textured || batch.water) continue;
+        auto cached = app.textureCache.find(batch.textureKey);
+        ID3D11ShaderResourceView* srv = cached != app.textureCache.end() ? cached->second.srv : nullptr;
+        DrawViewportVertices(batch.vertices, srv, g_wrapSamplerState, drawConstants);
     }
 
     g_pd3dDeviceContext->OMSetDepthStencilState(g_viewportRenderer.depthReadState, 0);
     drawConstants.useTexture = 0.0f;
     drawConstants.alphaTest = 0.0f;
     drawConstants.alphaScale = 0.55f;
-    DrawViewportVertices(water, g_viewportRenderer.whiteSrv, g_clampSamplerState, drawConstants);
+    for (const ViewportMeshBatch& batch : app.viewportBatches) {
+        if (!batch.water) continue;
+        DrawViewportVertices(batch.vertices, g_viewportRenderer.whiteSrv, g_clampSamplerState, drawConstants);
+    }
 
     ID3D11ShaderResourceView* nullSrv = nullptr;
     g_pd3dDeviceContext->PSSetShaderResources(0, 1, &nullSrv);
@@ -2860,6 +3043,10 @@ static void RenderEditor(AppState& app)
     if (ImGui::Button(app.viewMode == LevelViewMode::GeometryOnly ? "[Geometry Only]" : "Geometry Only", ImVec2(134.0f, 28.0f))) app.viewMode = LevelViewMode::GeometryOnly;
     ImGui::SameLine();
     if (ImGui::Button(app.viewMode == LevelViewMode::TextureMode ? "[Texture Mode]" : "Texture Mode", ImVec2(128.0f, 28.0f))) app.viewMode = LevelViewMode::TextureMode;
+    if (app.cachedViewMode != app.viewMode) {
+        app.cachedViewMode = app.viewMode;
+        app.viewportBatchesDirty = true;
+    }
     ImGui::SameLine();
     ImGui::Checkbox("Fly", &app.flyCamera);
     if (app.levelDirty) {

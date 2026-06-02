@@ -13,7 +13,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Define executable and source files (Swapped SDL2/OpenGL for Win32/DX11)
 add_executable(BoxStudio 
     src/main.cpp
-    third_party/glad/src/gl.c
     third_party/imgui/imgui.cpp
     third_party/imgui/imgui_demo.cpp
     third_party/imgui/imgui_draw.cpp
@@ -26,7 +25,6 @@ add_executable(BoxStudio
 # Global include directories
 target_include_directories(BoxStudio PRIVATE 
     include
-    third_party/glad/include
     third_party/imgui
     third_party/imgui/backends
 )
