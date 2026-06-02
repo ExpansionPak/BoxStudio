@@ -32,7 +32,7 @@ target_include_directories(BoxStudio PRIVATE
 )
 
 # Link native Windows DirectX 11 library
-target_link_libraries(BoxStudio PRIVATE d3d11)
+target_link_libraries(BoxStudio PRIVATE d3d11 d3dcompiler)
 
 # Cross-platform SDL2 dependency resolution (Kept for your other cross-platform systems)
 find_package(SDL2 QUIET)

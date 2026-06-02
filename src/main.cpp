@@ -7,6 +7,7 @@
 #endif
 
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <windows.h>
 #include <shobjidl.h>
 
@@ -14,6 +15,7 @@
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <atomic>
@@ -39,6 +41,32 @@ static UINT g_ResizeWidth = 0;
 static UINT g_ResizeHeight = 0;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 static ID3D11SamplerState* g_wrapSamplerState = nullptr;
+static ID3D11SamplerState* g_clampSamplerState = nullptr;
+
+struct ViewportRenderer {
+    ID3D11Texture2D* color = nullptr;
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    ID3D11Texture2D* depth = nullptr;
+    ID3D11DepthStencilView* dsv = nullptr;
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+    ID3D11InputLayout* inputLayout = nullptr;
+    ID3D11Buffer* vertexBuffer = nullptr;
+    ID3D11Buffer* cameraBuffer = nullptr;
+    ID3D11Buffer* drawBuffer = nullptr;
+    ID3D11BlendState* blendState = nullptr;
+    ID3D11DepthStencilState* depthWriteState = nullptr;
+    ID3D11DepthStencilState* depthReadState = nullptr;
+    ID3D11RasterizerState* solidRasterizer = nullptr;
+    ID3D11RasterizerState* wireRasterizer = nullptr;
+    ID3D11ShaderResourceView* whiteSrv = nullptr;
+    int width = 0;
+    int height = 0;
+    int vertexCapacity = 0;
+};
+
+static ViewportRenderer g_viewportRenderer;
 
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
@@ -101,6 +129,27 @@ struct GpuTexture {
     int height = 0;
     ID3D11ShaderResourceView* srv = nullptr;
     std::string error;
+};
+
+struct ViewportVertex {
+    float x, y, z;
+    float u, v;
+    float r, g, b, a;
+};
+
+struct ViewportCameraConstants {
+    float camera[4];
+    float right[4];
+    float up[4];
+    float forward[4];
+    float viewport[4];
+};
+
+struct ViewportDrawConstants {
+    float useTexture = 0.0f;
+    float alphaTest = 0.0f;
+    float alphaScale = 1.0f;
+    float pad = 0.0f;
 };
 
 struct LevelInfo {
@@ -1437,6 +1486,224 @@ static GpuTexture* GetGpuTexture(AppState& app, const MeshTriangle& tri)
     return inserted.first->second.srv != nullptr ? &inserted.first->second : nullptr;
 }
 
+static void ReleaseViewportTarget()
+{
+    if (g_viewportRenderer.color) { g_viewportRenderer.color->Release(); g_viewportRenderer.color = nullptr; }
+    if (g_viewportRenderer.rtv) { g_viewportRenderer.rtv->Release(); g_viewportRenderer.rtv = nullptr; }
+    if (g_viewportRenderer.srv) { g_viewportRenderer.srv->Release(); g_viewportRenderer.srv = nullptr; }
+    if (g_viewportRenderer.depth) { g_viewportRenderer.depth->Release(); g_viewportRenderer.depth = nullptr; }
+    if (g_viewportRenderer.dsv) { g_viewportRenderer.dsv->Release(); g_viewportRenderer.dsv = nullptr; }
+    g_viewportRenderer.width = 0;
+    g_viewportRenderer.height = 0;
+}
+
+static void ReleaseViewportRenderer()
+{
+    ReleaseViewportTarget();
+    if (g_viewportRenderer.vs) { g_viewportRenderer.vs->Release(); g_viewportRenderer.vs = nullptr; }
+    if (g_viewportRenderer.ps) { g_viewportRenderer.ps->Release(); g_viewportRenderer.ps = nullptr; }
+    if (g_viewportRenderer.inputLayout) { g_viewportRenderer.inputLayout->Release(); g_viewportRenderer.inputLayout = nullptr; }
+    if (g_viewportRenderer.vertexBuffer) { g_viewportRenderer.vertexBuffer->Release(); g_viewportRenderer.vertexBuffer = nullptr; }
+    if (g_viewportRenderer.cameraBuffer) { g_viewportRenderer.cameraBuffer->Release(); g_viewportRenderer.cameraBuffer = nullptr; }
+    if (g_viewportRenderer.drawBuffer) { g_viewportRenderer.drawBuffer->Release(); g_viewportRenderer.drawBuffer = nullptr; }
+    if (g_viewportRenderer.blendState) { g_viewportRenderer.blendState->Release(); g_viewportRenderer.blendState = nullptr; }
+    if (g_viewportRenderer.depthWriteState) { g_viewportRenderer.depthWriteState->Release(); g_viewportRenderer.depthWriteState = nullptr; }
+    if (g_viewportRenderer.depthReadState) { g_viewportRenderer.depthReadState->Release(); g_viewportRenderer.depthReadState = nullptr; }
+    if (g_viewportRenderer.solidRasterizer) { g_viewportRenderer.solidRasterizer->Release(); g_viewportRenderer.solidRasterizer = nullptr; }
+    if (g_viewportRenderer.wireRasterizer) { g_viewportRenderer.wireRasterizer->Release(); g_viewportRenderer.wireRasterizer = nullptr; }
+    if (g_viewportRenderer.whiteSrv) { g_viewportRenderer.whiteSrv->Release(); g_viewportRenderer.whiteSrv = nullptr; }
+    g_viewportRenderer.vertexCapacity = 0;
+}
+
+static bool CompileShader(const char* source, const char* entry, const char* target, ID3DBlob** blob)
+{
+    ID3DBlob* errors = nullptr;
+    const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
+    HRESULT hr = D3DCompile(source, strlen(source), nullptr, nullptr, nullptr, entry, target, flags, 0, blob, &errors);
+    if (errors != nullptr) {
+        errors->Release();
+    }
+    return SUCCEEDED(hr) && *blob != nullptr;
+}
+
+static bool EnsureViewportRenderer()
+{
+    if (g_pd3dDevice == nullptr) return false;
+    if (g_viewportRenderer.vs != nullptr && g_viewportRenderer.ps != nullptr) return true;
+
+    const char* shader = R"(
+cbuffer CameraBuffer : register(b0) {
+    float4 cameraPos;
+    float4 cameraRight;
+    float4 cameraUp;
+    float4 cameraForward;
+    float4 viewportData;
+};
+cbuffer DrawBuffer : register(b1) {
+    float useTexture;
+    float alphaTest;
+    float alphaScale;
+    float drawPad;
+};
+Texture2D tex0 : register(t0);
+SamplerState sampler0 : register(s0);
+
+struct VSIn {
+    float3 pos : POSITION;
+    float2 uv : TEXCOORD0;
+    float4 color : COLOR0;
+};
+struct VSOut {
+    float4 pos : SV_POSITION;
+    float2 uv : TEXCOORD0;
+    float4 color : COLOR0;
+};
+
+VSOut VSMain(VSIn input) {
+    float3 rel = input.pos - cameraPos.xyz;
+    float viewX = dot(rel, cameraRight.xyz);
+    float viewY = dot(rel, cameraUp.xyz);
+    float depth = dot(rel, cameraForward.xyz);
+    float nearZ = viewportData.z;
+    float farZ = viewportData.w;
+    float aspect = max(viewportData.x / max(viewportData.y, 1.0), 0.01);
+    float proj = 1.0 / tan(55.0 * 0.5 * 0.017453292519943295);
+    float z = depth * farZ / (farZ - nearZ) - nearZ * farZ / (farZ - nearZ);
+    VSOut output;
+    output.pos = float4(viewX * proj / aspect, viewY * proj, z, depth);
+    output.uv = input.uv;
+    output.color = input.color;
+    return output;
+}
+
+float4 PSMain(VSOut input) : SV_TARGET {
+    float4 tex = useTexture > 0.5 ? tex0.Sample(sampler0, input.uv) : float4(1.0, 1.0, 1.0, 1.0);
+    float4 color = tex * input.color;
+    color.a *= alphaScale;
+    if (alphaTest > 0.5 && color.a < 0.35) discard;
+    return color;
+}
+)";
+
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* psBlob = nullptr;
+    if (!CompileShader(shader, "VSMain", "vs_4_0", &vsBlob) || !CompileShader(shader, "PSMain", "ps_4_0", &psBlob)) {
+        if (vsBlob) vsBlob->Release();
+        if (psBlob) psBlob->Release();
+        return false;
+    }
+
+    HRESULT hr = g_pd3dDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_viewportRenderer.vs);
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_viewportRenderer.ps);
+    D3D11_INPUT_ELEMENT_DESC layout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0 }
+    };
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateInputLayout(layout, 3, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_viewportRenderer.inputLayout);
+    vsBlob->Release();
+    psBlob->Release();
+    if (FAILED(hr)) return false;
+
+    D3D11_BUFFER_DESC bufferDesc{};
+    bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+    bufferDesc.ByteWidth = sizeof(ViewportCameraConstants);
+    bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_pd3dDevice->CreateBuffer(&bufferDesc, nullptr, &g_viewportRenderer.cameraBuffer);
+    bufferDesc.ByteWidth = sizeof(ViewportDrawConstants);
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateBuffer(&bufferDesc, nullptr, &g_viewportRenderer.drawBuffer);
+
+    D3D11_BLEND_DESC blendDesc{};
+    blendDesc.RenderTarget[0].BlendEnable = TRUE;
+    blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateBlendState(&blendDesc, &g_viewportRenderer.blendState);
+
+    D3D11_DEPTH_STENCIL_DESC depthDesc{};
+    depthDesc.DepthEnable = TRUE;
+    depthDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    depthDesc.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateDepthStencilState(&depthDesc, &g_viewportRenderer.depthWriteState);
+    depthDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateDepthStencilState(&depthDesc, &g_viewportRenderer.depthReadState);
+
+    D3D11_RASTERIZER_DESC rasterDesc{};
+    rasterDesc.FillMode = D3D11_FILL_SOLID;
+    rasterDesc.CullMode = D3D11_CULL_NONE;
+    rasterDesc.DepthClipEnable = TRUE;
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateRasterizerState(&rasterDesc, &g_viewportRenderer.solidRasterizer);
+    rasterDesc.FillMode = D3D11_FILL_WIREFRAME;
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateRasterizerState(&rasterDesc, &g_viewportRenderer.wireRasterizer);
+
+    const unsigned char white[] = { 255, 255, 255, 255 };
+    D3D11_TEXTURE2D_DESC texDesc{};
+    texDesc.Width = 1;
+    texDesc.Height = 1;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Usage = D3D11_USAGE_IMMUTABLE;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA texData{};
+    texData.pSysMem = white;
+    texData.SysMemPitch = 4;
+    ID3D11Texture2D* whiteTexture = nullptr;
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateTexture2D(&texDesc, &texData, &whiteTexture);
+    if (SUCCEEDED(hr) && whiteTexture != nullptr) {
+        hr = g_pd3dDevice->CreateShaderResourceView(whiteTexture, nullptr, &g_viewportRenderer.whiteSrv);
+        whiteTexture->Release();
+    }
+    return SUCCEEDED(hr);
+}
+
+static bool EnsureViewportTarget(int width, int height)
+{
+    width = std::max(1, width);
+    height = std::max(1, height);
+    if (!EnsureViewportRenderer()) return false;
+    if (g_viewportRenderer.srv != nullptr && g_viewportRenderer.width == width && g_viewportRenderer.height == height) return true;
+    ReleaseViewportTarget();
+
+    D3D11_TEXTURE2D_DESC colorDesc{};
+    colorDesc.Width = static_cast<UINT>(width);
+    colorDesc.Height = static_cast<UINT>(height);
+    colorDesc.MipLevels = 1;
+    colorDesc.ArraySize = 1;
+    colorDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    colorDesc.SampleDesc.Count = 1;
+    colorDesc.Usage = D3D11_USAGE_DEFAULT;
+    colorDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    HRESULT hr = g_pd3dDevice->CreateTexture2D(&colorDesc, nullptr, &g_viewportRenderer.color);
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateRenderTargetView(g_viewportRenderer.color, nullptr, &g_viewportRenderer.rtv);
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateShaderResourceView(g_viewportRenderer.color, nullptr, &g_viewportRenderer.srv);
+
+    D3D11_TEXTURE2D_DESC depthDesc{};
+    depthDesc.Width = static_cast<UINT>(width);
+    depthDesc.Height = static_cast<UINT>(height);
+    depthDesc.MipLevels = 1;
+    depthDesc.ArraySize = 1;
+    depthDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depthDesc.SampleDesc.Count = 1;
+    depthDesc.Usage = D3D11_USAGE_DEFAULT;
+    depthDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateTexture2D(&depthDesc, nullptr, &g_viewportRenderer.depth);
+    if (SUCCEEDED(hr)) hr = g_pd3dDevice->CreateDepthStencilView(g_viewportRenderer.depth, nullptr, &g_viewportRenderer.dsv);
+    if (FAILED(hr)) {
+        ReleaseViewportTarget();
+        return false;
+    }
+    g_viewportRenderer.width = width;
+    g_viewportRenderer.height = height;
+    return true;
+}
+
 static float WrapUv(float value)
 {
     value = value - floorf(value);
@@ -2118,6 +2385,200 @@ static void CameraVectors(const AppState& app, Vec3& forward, Vec3& right, Vec3&
     up = { -sy * sp, cp, -cy * sp };
 }
 
+static Vec3 CurrentCameraPosition(const AppState& app)
+{
+    if (app.flyCamera) return app.cameraPosition;
+    const float cy = cosf(app.cameraYaw);
+    const float sy = sinf(app.cameraYaw);
+    const float cp = cosf(app.cameraPitch);
+    const float sp = sinf(app.cameraPitch);
+    return {
+        app.cameraTarget.x + sy * cp * app.cameraDistance,
+        app.cameraTarget.y + sp * app.cameraDistance,
+        app.cameraTarget.z + cy * cp * app.cameraDistance
+    };
+}
+
+static float ColorChannel(ImU32 color, int shift)
+{
+    return static_cast<float>((color >> shift) & 0xff) / 255.0f;
+}
+
+static ViewportVertex MakeViewportVertex(const Vec3& pos, const ImVec2& uv, ImU32 color)
+{
+    return {
+        pos.x, pos.y, pos.z,
+        uv.x, uv.y,
+        ColorChannel(color, 0),
+        ColorChannel(color, 8),
+        ColorChannel(color, 16),
+        ColorChannel(color, 24)
+    };
+}
+
+static void EnsureViewportVertexBuffer(size_t vertexCount)
+{
+    if (g_pd3dDevice == nullptr || vertexCount == 0) return;
+    if (g_viewportRenderer.vertexBuffer != nullptr && g_viewportRenderer.vertexCapacity >= static_cast<int>(vertexCount)) return;
+    if (g_viewportRenderer.vertexBuffer != nullptr) {
+        g_viewportRenderer.vertexBuffer->Release();
+        g_viewportRenderer.vertexBuffer = nullptr;
+    }
+    g_viewportRenderer.vertexCapacity = static_cast<int>(std::max<size_t>(vertexCount, 4096));
+    D3D11_BUFFER_DESC desc{};
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.ByteWidth = static_cast<UINT>(sizeof(ViewportVertex) * g_viewportRenderer.vertexCapacity);
+    desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    g_pd3dDevice->CreateBuffer(&desc, nullptr, &g_viewportRenderer.vertexBuffer);
+}
+
+static void UpdateConstantBuffer(ID3D11Buffer* buffer, const void* data, size_t size)
+{
+    if (buffer == nullptr || g_pd3dDeviceContext == nullptr) return;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(g_pd3dDeviceContext->Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        memcpy(mapped.pData, data, size);
+        g_pd3dDeviceContext->Unmap(buffer, 0);
+    }
+}
+
+static void DrawViewportVertices(const std::vector<ViewportVertex>& vertices, ID3D11ShaderResourceView* texture, ID3D11SamplerState* sampler, const ViewportDrawConstants& constants)
+{
+    if (vertices.empty() || g_viewportRenderer.vertexBuffer == nullptr || g_pd3dDeviceContext == nullptr) return;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(g_pd3dDeviceContext->Map(g_viewportRenderer.vertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;
+    memcpy(mapped.pData, vertices.data(), vertices.size() * sizeof(ViewportVertex));
+    g_pd3dDeviceContext->Unmap(g_viewportRenderer.vertexBuffer, 0);
+
+    UpdateConstantBuffer(g_viewportRenderer.drawBuffer, &constants, sizeof(constants));
+    ID3D11ShaderResourceView* srv = texture != nullptr ? texture : g_viewportRenderer.whiteSrv;
+    ID3D11SamplerState* chosenSampler = sampler != nullptr ? sampler : g_clampSamplerState;
+    g_pd3dDeviceContext->PSSetShaderResources(0, 1, &srv);
+    g_pd3dDeviceContext->PSSetSamplers(0, 1, &chosenSampler);
+    g_pd3dDeviceContext->Draw(static_cast<UINT>(vertices.size()), 0);
+}
+
+static bool RenderViewportScene(AppState& app, int width, int height)
+{
+    if (!EnsureViewportTarget(width, height)) return false;
+    ID3D11RenderTargetView* rtv = g_viewportRenderer.rtv;
+    g_pd3dDeviceContext->OMSetRenderTargets(1, &rtv, g_viewportRenderer.dsv);
+    const float clear[] = { 0.074f, 0.083f, 0.090f, 1.0f };
+    g_pd3dDeviceContext->ClearRenderTargetView(g_viewportRenderer.rtv, clear);
+    g_pd3dDeviceContext->ClearDepthStencilView(g_viewportRenderer.dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    D3D11_VIEWPORT viewport{};
+    viewport.Width = static_cast<float>(width);
+    viewport.Height = static_cast<float>(height);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    g_pd3dDeviceContext->RSSetViewports(1, &viewport);
+    g_pd3dDeviceContext->IASetInputLayout(g_viewportRenderer.inputLayout);
+    g_pd3dDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    UINT stride = sizeof(ViewportVertex);
+    UINT offset = 0;
+    g_pd3dDeviceContext->IASetVertexBuffers(0, 1, &g_viewportRenderer.vertexBuffer, &stride, &offset);
+    g_pd3dDeviceContext->VSSetShader(g_viewportRenderer.vs, nullptr, 0);
+    g_pd3dDeviceContext->PSSetShader(g_viewportRenderer.ps, nullptr, 0);
+    g_pd3dDeviceContext->VSSetConstantBuffers(0, 1, &g_viewportRenderer.cameraBuffer);
+    g_pd3dDeviceContext->PSSetConstantBuffers(1, 1, &g_viewportRenderer.drawBuffer);
+
+    Vec3 forward, right, up;
+    CameraVectors(app, forward, right, up);
+    const Vec3 camera = CurrentCameraPosition(app);
+    ViewportCameraConstants cameraConstants{};
+    cameraConstants.camera[0] = camera.x; cameraConstants.camera[1] = camera.y; cameraConstants.camera[2] = camera.z;
+    cameraConstants.right[0] = right.x; cameraConstants.right[1] = right.y; cameraConstants.right[2] = right.z;
+    cameraConstants.up[0] = up.x; cameraConstants.up[1] = up.y; cameraConstants.up[2] = up.z;
+    cameraConstants.forward[0] = forward.x; cameraConstants.forward[1] = forward.y; cameraConstants.forward[2] = forward.z;
+    cameraConstants.viewport[0] = static_cast<float>(width);
+    cameraConstants.viewport[1] = static_cast<float>(height);
+    cameraConstants.viewport[2] = 8.0f;
+    cameraConstants.viewport[3] = 24000.0f;
+    UpdateConstantBuffer(g_viewportRenderer.cameraBuffer, &cameraConstants, sizeof(cameraConstants));
+
+    std::vector<ViewportVertex> untextured;
+    std::vector<ViewportVertex> water;
+    struct TextureBatch {
+        std::vector<ViewportVertex> vertices;
+        ID3D11ShaderResourceView* srv = nullptr;
+        bool clamp = false;
+    };
+    std::unordered_map<std::string, TextureBatch> textureBatches;
+
+    for (const MeshTriangle& tri : app.mesh.triangles) {
+        if (tri.a >= static_cast<int>(app.mesh.vertices.size()) || tri.b >= static_cast<int>(app.mesh.vertices.size()) || tri.c >= static_cast<int>(app.mesh.vertices.size())) continue;
+        const bool isWater = tri.surface.find("WATER") != std::string::npos;
+        const bool textured = app.viewMode == LevelViewMode::TextureMode && tri.surface == "RENDER";
+        ImU32 color = SurfaceColor(tri, app);
+        if (app.viewMode == LevelViewMode::TextureMode && tri.surface == "RENDER") color = IM_COL32(255, 255, 255, 255);
+        if (isWater) color = IM_COL32(70, 145, 190, 105);
+
+        std::vector<ViewportVertex>* target = &untextured;
+        ID3D11ShaderResourceView* textureSrv = nullptr;
+        GpuTexture* gpuTexture = nullptr;
+        if (textured) {
+            gpuTexture = GetGpuTexture(app, tri);
+            if (gpuTexture != nullptr) textureSrv = gpuTexture->srv;
+        }
+
+        ImVec2 uva = tri.uva, uvb = tri.uvb, uvc = tri.uvc;
+        if (gpuTexture != nullptr) {
+            uva = NormalizeUv(tri.uva, *gpuTexture, tri.textureClamp);
+            uvb = NormalizeUv(tri.uvb, *gpuTexture, tri.textureClamp);
+            uvc = NormalizeUv(tri.uvc, *gpuTexture, tri.textureClamp);
+        }
+
+        if (isWater) {
+            target = &water;
+        } else if (textureSrv != nullptr) {
+            const std::string key = TextureCacheKey(tri);
+            TextureBatch& batch = textureBatches[key];
+            batch.srv = textureSrv;
+            batch.clamp = tri.textureClamp;
+            target = &batch.vertices;
+        }
+        target->push_back(MakeViewportVertex(app.mesh.vertices[tri.a], uva, color));
+        target->push_back(MakeViewportVertex(app.mesh.vertices[tri.b], uvb, color));
+        target->push_back(MakeViewportVertex(app.mesh.vertices[tri.c], uvc, color));
+    }
+
+    size_t maxVertices = untextured.size() + water.size();
+    for (const auto& item : textureBatches) maxVertices = std::max(maxVertices, item.second.vertices.size());
+    EnsureViewportVertexBuffer(maxVertices);
+    g_pd3dDeviceContext->IASetVertexBuffers(0, 1, &g_viewportRenderer.vertexBuffer, &stride, &offset);
+
+    float blendFactor[4] = { 0, 0, 0, 0 };
+    g_pd3dDeviceContext->OMSetBlendState(g_viewportRenderer.blendState, blendFactor, 0xffffffff);
+    g_pd3dDeviceContext->OMSetDepthStencilState(g_viewportRenderer.depthWriteState, 0);
+    g_pd3dDeviceContext->RSSetState(app.viewMode == LevelViewMode::Wireframe ? g_viewportRenderer.wireRasterizer : g_viewportRenderer.solidRasterizer);
+
+    ViewportDrawConstants drawConstants{};
+    drawConstants.useTexture = 0.0f;
+    drawConstants.alphaTest = 0.0f;
+    drawConstants.alphaScale = 1.0f;
+    DrawViewportVertices(untextured, g_viewportRenderer.whiteSrv, g_clampSamplerState, drawConstants);
+
+    drawConstants.useTexture = 1.0f;
+    drawConstants.alphaTest = 1.0f;
+    drawConstants.alphaScale = 1.0f;
+    for (const auto& item : textureBatches) {
+        DrawViewportVertices(item.second.vertices, item.second.srv, item.second.clamp ? g_clampSamplerState : g_wrapSamplerState, drawConstants);
+    }
+
+    g_pd3dDeviceContext->OMSetDepthStencilState(g_viewportRenderer.depthReadState, 0);
+    drawConstants.useTexture = 0.0f;
+    drawConstants.alphaTest = 0.0f;
+    drawConstants.alphaScale = 0.55f;
+    DrawViewportVertices(water, g_viewportRenderer.whiteSrv, g_clampSamplerState, drawConstants);
+
+    ID3D11ShaderResourceView* nullSrv = nullptr;
+    g_pd3dDeviceContext->PSSetShaderResources(0, 1, &nullSrv);
+    g_pd3dDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+    return true;
+}
+
 static void Draw3DViewport(AppState& app)
 {
     ImGui::BeginChild("Viewport", ImVec2(0.0f, -4.0f), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -2165,81 +2626,15 @@ static void Draw3DViewport(AppState& app)
         if (ImGui::IsKeyDown(ImGuiKey_Q)) app.cameraPosition.y -= speed;
     }
 
-    for (int i = -8; i <= 8; ++i) {
-        float d1, d2;
-        ImVec2 a, b, c, d;
-        bool ab = ProjectPointVisible({ -800.0f, 0.0f, i * 100.0f }, app, canvasPos, canvasSize, a, d1) &&
-            ProjectPointVisible({ 800.0f, 0.0f, i * 100.0f }, app, canvasPos, canvasSize, b, d2);
-        bool cd = ProjectPointVisible({ i * 100.0f, 0.0f, -800.0f }, app, canvasPos, canvasSize, c, d1) &&
-            ProjectPointVisible({ i * 100.0f, 0.0f, 800.0f }, app, canvasPos, canvasSize, d, d2);
-        ImU32 color = i == 0 ? IM_COL32(92, 122, 126, 255) : IM_COL32(42, 50, 54, 255);
-        if (ab) draw->AddLine(a, b, color, i == 0 ? 2.0f : 1.0f);
-        if (cd) draw->AddLine(c, d, color, i == 0 ? 2.0f : 1.0f);
-    }
-
-    if (!app.mesh.triangles.empty()) {
-        std::vector<int> order(app.mesh.triangles.size());
-        for (int i = 0; i < static_cast<int>(order.size()); ++i) order[i] = i;
-        std::stable_sort(order.begin(), order.end(), [&](int lhs, int rhs) {
-            return TriangleAverageDepth(app.mesh.triangles[lhs], app) > TriangleAverageDepth(app.mesh.triangles[rhs], app);
-        });
-
-        if (app.viewMode == LevelViewMode::TextureMode && app.mesh.renderMesh && g_wrapSamplerState != nullptr) {
-            draw->AddCallback(DrawCallback_SetWrapSampler, nullptr);
-        }
-        const size_t maxDrawn = app.mesh.renderMesh ? order.size() : std::min<size_t>(order.size(), 9000);
-        for (int waterPass = 0; waterPass < 2; ++waterPass) {
-        for (size_t oi = 0; oi < maxDrawn; ++oi) {
-            const MeshTriangle& tri = app.mesh.triangles[order[oi]];
-            const bool water = tri.surface.find("WATER") != std::string::npos;
-            if (water != (waterPass == 1)) continue;
-            if (tri.a >= static_cast<int>(app.mesh.vertices.size()) || tri.b >= static_cast<int>(app.mesh.vertices.size()) || tri.c >= static_cast<int>(app.mesh.vertices.size())) continue;
-            float da, db, dc;
-            ImVec2 pa, pb, pc;
-            const bool va = ProjectPointVisible(app.mesh.vertices[tri.a], app, canvasPos, canvasSize, pa, da);
-            const bool vb = ProjectPointVisible(app.mesh.vertices[tri.b], app, canvasPos, canvasSize, pb, db);
-            const bool vc = ProjectPointVisible(app.mesh.vertices[tri.c], app, canvasPos, canvasSize, pc, dc);
-            const bool canSubdivideTexture = app.viewMode == LevelViewMode::TextureMode && tri.surface == "RENDER" && (va || vb || vc);
-            if (!canSubdivideTexture && !(va && vb && vc)) {
-                continue;
-            }
-            ImVec2 points[3] = { pa, pb, pc };
-            if (app.viewMode != LevelViewMode::Wireframe) {
-                bool drewTexture = false;
-                if (app.viewMode == LevelViewMode::TextureMode && tri.surface == "RENDER") {
-                    if (GpuTexture* texture = GetGpuTexture(app, tri)) {
-                        const int texturedPieces = DrawTexturedTriangleSubdivided(draw, app, canvasPos, canvasSize, tri, *texture);
-                        drewTexture = texturedPieces > 0;
-                        app.textureTrianglesDrawn += texturedPieces;
-                    } else {
-                        ++app.textureTrianglesMissing;
-                    }
-                }
-                if (!drewTexture && !(va && vb && vc)) continue;
-                if (!drewTexture) draw->AddConvexPolyFilled(points, 3, SurfaceColor(tri, app));
-            }
-            if (va && vb && vc) draw->AddPolyline(points, 3, app.viewMode == LevelViewMode::Wireframe ? IM_COL32(105, 210, 235, 230) : IM_COL32(18, 24, 27, app.viewMode == LevelViewMode::TextureMode ? 38 : 120), ImDrawFlags_Closed, app.viewMode == LevelViewMode::Wireframe ? 1.5f : 1.0f);
-            if (app.viewMode == LevelViewMode::Wireframe) {
-                draw->AddCircleFilled(pa, 2.0f, IM_COL32(230, 246, 255, 230));
-                draw->AddCircleFilled(pb, 2.0f, IM_COL32(230, 246, 255, 230));
-                draw->AddCircleFilled(pc, 2.0f, IM_COL32(230, 246, 255, 230));
-            }
-        }
-        }
-        if (app.viewMode == LevelViewMode::TextureMode && app.mesh.renderMesh && g_wrapSamplerState != nullptr) {
-            ImDrawCallback reset = ImGui::GetPlatformIO().DrawCallback_ResetRenderState;
-            if (reset != nullptr) draw->AddCallback(reset, nullptr);
-        }
-        if (!app.mesh.renderMesh && order.size() > maxDrawn) {
-            draw->AddText(ImVec2(canvasPos.x + 12.0f, canvasPos.y + 30.0f), IM_COL32(230, 190, 90, 255), "Large collision mesh preview capped for editor responsiveness");
-        }
+    if (!app.mesh.triangles.empty() && RenderViewportScene(app, static_cast<int>(canvasSize.x), static_cast<int>(canvasSize.y)) && g_viewportRenderer.srv != nullptr) {
+        draw->AddImage(reinterpret_cast<ImTextureID>(g_viewportRenderer.srv),
+            canvasPos, ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y));
         if (app.viewMode == LevelViewMode::TextureMode && app.mesh.renderMesh) {
-            std::string textureStatus = "Texture triangles: " + std::to_string(app.textureTrianglesDrawn);
-            if (app.textureTrianglesMissing > 0) textureStatus += "  missing: " + std::to_string(app.textureTrianglesMissing);
-            draw->AddText(ImVec2(canvasPos.x + 12.0f, canvasPos.y + canvasSize.y - 24.0f), app.textureTrianglesDrawn > 0 ? IM_COL32(190, 230, 180, 230) : IM_COL32(230, 190, 90, 255), textureStatus.c_str());
+            const std::string textureStatus = "DX11 viewport: " + std::to_string(app.mesh.triangles.size()) + " triangles";
+            draw->AddText(ImVec2(canvasPos.x + 12.0f, canvasPos.y + canvasSize.y - 24.0f), IM_COL32(190, 230, 180, 230), textureStatus.c_str());
         }
     } else {
-        draw->AddText(ImVec2(canvasPos.x + 12.0f, canvasPos.y + 30.0f), IM_COL32(230, 190, 90, 255), "No collision.inc.c mesh found for this level yet");
+        draw->AddText(ImVec2(canvasPos.x + 12.0f, canvasPos.y + 30.0f), IM_COL32(230, 190, 90, 255), "No renderable level mesh found yet");
     }
 
     int hoveredObject = -1;
@@ -2842,13 +3237,19 @@ bool CreateDeviceD3D(HWND hWnd)
     samplerDesc.MinLOD = 0.0f;
     samplerDesc.MaxLOD = 0.0f;
     g_pd3dDevice->CreateSamplerState(&samplerDesc, &g_wrapSamplerState);
+    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    g_pd3dDevice->CreateSamplerState(&samplerDesc, &g_clampSamplerState);
     return true;
 }
 
 void CleanupDeviceD3D()
 {
+    ReleaseViewportRenderer();
     CleanupRenderTarget();
     if (g_wrapSamplerState) { g_wrapSamplerState->Release(); g_wrapSamplerState = nullptr; }
+    if (g_clampSamplerState) { g_clampSamplerState->Release(); g_clampSamplerState = nullptr; }
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
     if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
