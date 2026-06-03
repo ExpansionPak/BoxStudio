@@ -243,6 +243,8 @@ struct AppState {
     bool projectLoaded = false;
     EditorMode editorMode = EditorMode::LevelMenu;
     LevelViewMode viewMode = LevelViewMode::GeometryOnly;
+    bool rotateGizmo = false;
+    int activeGizmoAxis = -1;
     bool levelDirty = false;
     bool pendingExit = false;
     bool pendingLevelMenu = false;
@@ -304,6 +306,15 @@ static std::string EscapeJson(const std::string& value)
 static std::string Slurp(const fs::path& path);
 static std::vector<std::string> SplitArgs(const std::string& args);
 
+struct MacroCall {
+    size_t start = 0;
+    size_t end = 0;
+    std::string name;
+    std::string args;
+};
+
+static std::vector<MacroCall> FindObjectMacros(const std::string& text);
+
 static std::string SanitizeFolderName(std::string value)
 {
     for (char& c : value) {
@@ -313,6 +324,36 @@ static std::string SanitizeFolderName(std::string value)
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
     return value.empty() ? "Untitled BoxStudio Project" : value;
+}
+
+static std::string ToLevelEnumName(const std::string& levelName)
+{
+    std::string value = "LEVEL_";
+    for (char c : levelName) {
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            value += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        } else {
+            value += '_';
+        }
+    }
+    return value;
+}
+
+static std::string SanitizeLevelName(std::string value)
+{
+    for (char& c : value) {
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        } else {
+            c = '_';
+        }
+    }
+    while (value.find("__") != std::string::npos) {
+        value = std::regex_replace(value, std::regex("__+"), "_");
+    }
+    while (!value.empty() && value.front() == '_') value.erase(value.begin());
+    while (!value.empty() && value.back() == '_') value.pop_back();
+    return value.empty() ? "boxstudio_level" : value;
 }
 
 static fs::path DefaultProjectsRoot()
@@ -488,6 +529,11 @@ static bool WriteLevelScene(const Project& project, const LevelInfo& level, cons
 
 static std::string FormatLevelObject(const LevelObject& object)
 {
+    std::string behParam = object.behParam;
+    if (object.model == "MODEL_KOOPA_WITH_SHELL" && object.behavior == "bhvKoopa" && behParam == "0x00000000") {
+        behParam = "0x00010000";
+    }
+
     std::ostringstream out;
     out << "        OBJECT(" << object.model << ", "
         << static_cast<int>(object.position.x) << ", "
@@ -496,7 +542,7 @@ static std::string FormatLevelObject(const LevelObject& object)
         << static_cast<int>(object.rotation.x) << ", "
         << static_cast<int>(object.rotation.y) << ", "
         << static_cast<int>(object.rotation.z) << ", "
-        << object.behParam << ", "
+        << behParam << ", "
         << object.behavior << "),";
     return out.str();
 }
@@ -515,6 +561,44 @@ static std::string ModelLoadCommandFor(const std::string& model)
     return it == known.end() ? std::string{} : it->second;
 }
 
+static std::string ModelSegmentRequirement(const std::string& model)
+{
+    static const std::unordered_map<std::string, std::string> requirements = {
+        { "MODEL_GOOMBA", "_common0_" },
+        { "MODEL_KOOPA_WITH_SHELL", "_group14_" },
+        { "MODEL_BITS_WARP_PIPE", "_common1_" },
+        { "MODEL_THI_WARP_PIPE", "_common1_" }
+    };
+    auto it = requirements.find(model);
+    return it == requirements.end() ? std::string{} : it->second;
+}
+
+static std::string ModelSupportProblem(const std::string& script, const LevelObject& object)
+{
+    if (object.model.empty() || object.behavior.empty()) {
+        return "object is missing a model or behavior.";
+    }
+
+    const std::string required = ModelSegmentRequirement(object.model);
+    if (required.empty() || script.find(required) != std::string::npos) return {};
+
+    if (object.model == "MODEL_KOOPA_WITH_SHELL") {
+        return "Koopa needs actor group14 loaded in segment 0x06/0x0D.";
+    }
+    if (object.model == "MODEL_GOOMBA") {
+        return "Goomba needs common0 loaded in segment 0x08/0x0F.";
+    }
+    return object.model + " needs " + required + " loaded by this level.";
+}
+
+static bool LevelScriptSupportsModel(const LevelInfo& level, const std::string& model)
+{
+    const std::string required = ModelSegmentRequirement(model);
+    if (required.empty()) return true;
+    const std::string script = Slurp(level.scriptPath);
+    return script.find(required) != std::string::npos;
+}
+
 static void InjectBoxStudioModelLoads(std::string& script, const std::vector<LevelObject>& objects)
 {
     const std::string beginText = "    /* BOXSTUDIO_MODEL_LOADS_BEGIN */";
@@ -531,6 +615,7 @@ static void InjectBoxStudioModelLoads(std::string& script, const std::vector<Lev
     std::vector<std::string> commands;
     for (const LevelObject& object : objects) {
         if (object.fromScript) continue;
+        if (!ModelSupportProblem(script, object).empty()) continue;
         const std::string command = ModelLoadCommandFor(object.model);
         if (!command.empty() && script.find(command) == std::string::npos &&
             std::find(commands.begin(), commands.end(), command) == commands.end()) {
@@ -545,7 +630,30 @@ static void InjectBoxStudioModelLoads(std::string& script, const std::vector<Lev
     }
     block += endText + "\n";
 
-    size_t insert = script.find("INIT_LEVEL()");
+    size_t insert = script.find("MARIO(");
+    if (insert != std::string::npos) {
+        insert = script.find('\n', insert);
+        if (insert != std::string::npos) {
+            size_t afterModelSetup = insert + 1;
+            size_t scan = afterModelSetup;
+            while (true) {
+                const size_t lineEnd = script.find('\n', scan);
+                const size_t lineLimit = lineEnd == std::string::npos ? script.size() : lineEnd;
+                const std::string line = script.substr(scan, lineLimit - scan);
+                if (line.find("JUMP_LINK(script_func_global_") == std::string::npos &&
+                    line.find("LOAD_MODEL_FROM_GEO(") == std::string::npos &&
+                    line.find("LOAD_MODEL_FROM_DL(") == std::string::npos) {
+                    break;
+                }
+                afterModelSetup = lineEnd == std::string::npos ? script.size() : lineEnd + 1;
+                if (lineEnd == std::string::npos) break;
+                scan = afterModelSetup;
+            }
+            script.insert(afterModelSetup, block);
+            return;
+        }
+    }
+    insert = script.find("ALLOC_LEVEL_POOL()");
     if (insert != std::string::npos) {
         insert = script.find('\n', insert);
         if (insert != std::string::npos) {
@@ -557,17 +665,40 @@ static void InjectBoxStudioModelLoads(std::string& script, const std::vector<Lev
     if (insert != std::string::npos) script.insert(insert, block);
 }
 
+static size_t FindAreaCommandInsertPoint(const std::string& script)
+{
+    const size_t areaStart = script.find("AREA(");
+    if (areaStart == std::string::npos) return std::string::npos;
+
+    const size_t areaEnd = script.find("END_AREA()", areaStart);
+    if (areaEnd == std::string::npos) return std::string::npos;
+
+    size_t insert = areaEnd;
+    const char* markers[] = {
+        "\n        TERRAIN(",
+        "\n        MACRO_OBJECTS(",
+        "\n        SET_BACKGROUND_MUSIC(",
+        "\n        TERRAIN_TYPE("
+    };
+    for (const char* marker : markers) {
+        const size_t markerPos = script.find(marker, areaStart);
+        if (markerPos != std::string::npos && markerPos < areaEnd && markerPos < insert) {
+            insert = markerPos + 1;
+        }
+    }
+    return insert;
+}
+
 static std::string RepairLegacyEightArgObjects(const std::string& script)
 {
-    std::regex objectPattern(R"(OBJECT\s*\(([^()\n;]+)\))");
     std::string repaired;
     size_t cursor = 0;
-    for (auto it = std::sregex_iterator(script.begin(), script.end(), objectPattern), end = std::sregex_iterator(); it != end; ++it) {
-        const std::smatch& match = *it;
-        const std::vector<std::string> args = SplitArgs(match[1].str());
-        if (args.size() != 8) continue;
+    for (const MacroCall& call : FindObjectMacros(script)) {
+        if (call.name != "OBJECT") continue;
+        const std::vector<std::string> args = SplitArgs(call.args);
+        if (args.size() != 8 || call.start < cursor) continue;
 
-        repaired.append(script, cursor, static_cast<size_t>(match.position()) - cursor);
+        repaired.append(script, cursor, call.start - cursor);
         const bool lastIsBehavior = args[7].find("bhv") == 0;
         repaired += "OBJECT(";
         if (lastIsBehavior) {
@@ -585,20 +716,60 @@ static std::string RepairLegacyEightArgObjects(const std::string& script)
             repaired += ", bhvStaticObject";
         }
         repaired += ")";
-        cursor = static_cast<size_t>(match.position() + match.length());
+        cursor = call.end;
     }
     if (cursor == 0) return script;
     repaired.append(script, cursor, std::string::npos);
     return repaired;
 }
 
-static bool WriteObjectsToLevelScript(const LevelInfo& level, const std::vector<LevelObject>& objects, std::string& error)
+static void EnsureHackerSm64ScriptIncludes(std::string& script, const std::string& levelName)
+{
+    if (script.find("#include \"level_commands.h\"") != std::string::npos) return;
+
+    std::string includes;
+    includes += "#include <ultra64.h>\n";
+    includes += "#include \"sm64.h\"\n";
+    includes += "#include \"behavior_data.h\"\n";
+    includes += "#include \"model_ids.h\"\n";
+    includes += "#include \"seq_ids.h\"\n";
+    includes += "#include \"segment_symbols.h\"\n";
+    includes += "#include \"level_commands.h\"\n\n";
+    includes += "#include \"game/level_update.h\"\n\n";
+    includes += "#include \"levels/scripts.h\"\n\n";
+    includes += "#include \"actors/common1.h\"\n\n";
+    includes += "#include \"make_const_nonconst.h\"\n";
+    includes += "#include \"levels/" + levelName + "/header.h\"\n";
+
+    std::regex includePattern(R"((?:#include[^\n]*\n)+\s*)");
+    std::smatch match;
+    if (std::regex_search(script, match, includePattern) && match.position() == 0) {
+        script.replace(0, static_cast<size_t>(match.length()), includes + "\n");
+    } else {
+        script.insert(0, includes + "\n");
+    }
+}
+
+static void RepairGeneratedLevelEnumReferences(std::string& script, const std::string& levelName)
+{
+    const std::string legacy = "LEVEL_" + levelName;
+    const std::string fixed = ToLevelEnumName(levelName);
+    size_t pos = 0;
+    while ((pos = script.find(legacy, pos)) != std::string::npos) {
+        script.replace(pos, legacy.size(), fixed);
+        pos += fixed.size();
+    }
+}
+
+static bool WriteObjectsToLevelScript(const LevelInfo& level, const std::vector<LevelObject>& objects, std::string& error, std::string* warning = nullptr)
 {
     std::string script = Slurp(level.scriptPath);
     if (script.empty()) {
         error = "Level script is empty or missing.";
         return false;
     }
+    EnsureHackerSm64ScriptIncludes(script, level.name);
+    RepairGeneratedLevelEnumReferences(script, level.name);
     script = RepairLegacyEightArgObjects(script);
     InjectBoxStudioModelLoads(script, objects);
 
@@ -618,8 +789,14 @@ static bool WriteObjectsToLevelScript(const LevelInfo& level, const std::vector<
 
     std::string block = beginMarker;
     int written = 0;
+    std::vector<std::string> skipped;
     for (const LevelObject& object : objects) {
         if (object.fromScript) continue;
+        const std::string problem = ModelSupportProblem(script, object);
+        if (!problem.empty()) {
+            skipped.push_back(object.name + " (" + problem + ")");
+            continue;
+        }
         block += FormatLevelObject(object);
         block += "\n";
         ++written;
@@ -627,9 +804,9 @@ static bool WriteObjectsToLevelScript(const LevelInfo& level, const std::vector<
     block += endMarker;
 
     if (written > 0) {
-        const size_t insert = script.find("END_AREA()");
+        const size_t insert = FindAreaCommandInsertPoint(script);
         if (insert == std::string::npos) {
-            error = "Could not find END_AREA() to insert BoxStudio objects.";
+            error = "Could not find an AREA block to insert BoxStudio objects.";
             return false;
         }
         script.insert(insert, block);
@@ -641,6 +818,18 @@ static bool WriteObjectsToLevelScript(const LevelInfo& level, const std::vector<
         return false;
     }
     out << script;
+    if (warning != nullptr) {
+        warning->clear();
+        if (!skipped.empty()) {
+            *warning = "Skipped unsupported object";
+            if (skipped.size() != 1) *warning += "s";
+            *warning += ": ";
+            for (size_t i = 0; i < skipped.size(); ++i) {
+                if (i > 0) *warning += "; ";
+                *warning += skipped[i];
+            }
+        }
+    }
     return true;
 }
 
@@ -823,6 +1012,50 @@ static float NumberOrZero(const std::string& token)
     } catch (...) {
         return 0.0f;
     }
+}
+
+static std::vector<MacroCall> FindObjectMacros(const std::string& text)
+{
+    std::vector<MacroCall> calls;
+    size_t pos = 0;
+    while ((pos = text.find("OBJECT", pos)) != std::string::npos) {
+        if (pos > 0) {
+            const unsigned char before = static_cast<unsigned char>(text[pos - 1]);
+            if (std::isalnum(before) || before == '_') {
+                pos += 6;
+                continue;
+            }
+        }
+
+        std::string name = "OBJECT";
+        size_t nameEnd = pos + 6;
+        if (text.compare(nameEnd, 10, "_WITH_ACTS") == 0) {
+            name = "OBJECT_WITH_ACTS";
+            nameEnd += 10;
+        }
+        if (nameEnd >= text.size() || text[nameEnd] != '(') {
+            pos = nameEnd;
+            continue;
+        }
+
+        int depth = 0;
+        size_t close = std::string::npos;
+        for (size_t i = nameEnd; i < text.size(); ++i) {
+            if (text[i] == '(') ++depth;
+            if (text[i] == ')') {
+                --depth;
+                if (depth == 0) {
+                    close = i;
+                    break;
+                }
+            }
+        }
+        if (close == std::string::npos) break;
+
+        calls.push_back({ pos, close + 1, name, text.substr(nameEnd + 1, close - nameEnd - 1) });
+        pos = close + 1;
+    }
+    return calls;
 }
 
 static int IntOrZero(const std::string& token)
@@ -1992,38 +2225,54 @@ static int DrawTexturedTriangleSubdivided(ImDrawList* draw, const AppState& app,
 static std::vector<LevelObject> ParseLevelObjects(const LevelInfo& level)
 {
     std::vector<LevelObject> objects;
-    const std::string script = StripCComments(Slurp(level.scriptPath));
-    std::regex objectPattern(R"(OBJECT(?:_WITH_ACTS)?\s*\(([^;]+)\))");
-    auto begin = std::sregex_iterator(script.begin(), script.end(), objectPattern);
-    auto end = std::sregex_iterator();
     int index = 1;
 
-    for (auto it = begin; it != end; ++it) {
-        const std::vector<std::string> args = SplitArgs((*it)[1].str());
-        LevelObject object;
-        object.name = "Script Object " + std::to_string(index++);
-        object.fromScript = true;
-        if (!args.empty()) object.model = args[0];
-        if (args.size() >= 4) {
-            object.position = { NumberOrZero(args[1]), NumberOrZero(args[2]), NumberOrZero(args[3]) };
-        }
-        if (args.size() >= 7) {
-            object.rotation = { NumberOrZero(args[4]), NumberOrZero(args[5]), NumberOrZero(args[6]) };
-        }
-        if (args.size() >= 9) {
-            object.behParam = args[7];
-            object.behavior = args[8];
-        } else if (args.size() >= 8) {
-            if (args[7].find("bhv") == 0) {
-                object.behParam = "0x00000000";
-                object.behavior = args[7];
-            } else {
-                object.behParam = args[7];
-                object.behavior = "bhvStaticObject";
+    auto parseObjects = [&](const std::string& text, bool fromScript) {
+        const std::string script = StripCComments(text);
+
+        for (const MacroCall& call : FindObjectMacros(script)) {
+            const std::vector<std::string> args = SplitArgs(call.args);
+            if (args.empty()) continue;
+            LevelObject object;
+            object.name = (fromScript ? "Script Object " : "BoxStudio Object ") + std::to_string(index++);
+            object.fromScript = fromScript;
+            if (!args.empty()) object.model = args[0];
+            if (args.size() >= 4) {
+                object.position = { NumberOrZero(args[1]), NumberOrZero(args[2]), NumberOrZero(args[3]) };
             }
+            if (args.size() >= 7) {
+                object.rotation = { NumberOrZero(args[4]), NumberOrZero(args[5]), NumberOrZero(args[6]) };
+            }
+            if (args.size() >= 9) {
+                object.behParam = args[7];
+                object.behavior = args[8];
+            } else if (args.size() >= 8) {
+                if (args[7].find("bhv") == 0) {
+                    object.behParam = "0x00000000";
+                    object.behavior = args[7];
+                } else {
+                    object.behParam = args[7];
+                    object.behavior = "bhvStaticObject";
+                }
+            }
+            objects.push_back(object);
         }
-        objects.push_back(object);
+    };
+
+    std::string raw = Slurp(level.scriptPath);
+    const std::string beginText = "        /* BOXSTUDIO_OBJECTS_BEGIN */";
+    const std::string endText = "        /* BOXSTUDIO_OBJECTS_END */";
+    size_t begin = raw.find(beginText);
+    if (begin != std::string::npos) {
+        size_t end = raw.find(endText, begin);
+        if (end != std::string::npos) {
+            size_t endLine = raw.find('\n', end);
+            const size_t eraseEnd = endLine == std::string::npos ? raw.size() : endLine + 1;
+            parseObjects(raw.substr(begin, eraseEnd - begin), false);
+            raw.erase(begin, eraseEnd - begin);
+        }
     }
+    parseObjects(raw, true);
 
     if (objects.empty()) {
         objects.push_back({ "Mario start", "MODEL_MARIO", "0x00000000", "bhvMario", { 0.0f, 120.0f, 0.0f }, {}, 1.0f, false });
@@ -2147,9 +2396,42 @@ static void PollLevelLoad(AppState& app)
     app.status = "Editing " + app.levels[app.selectedLevel].name + ": loaded " + std::to_string(app.mesh.triangles.size()) + (app.mesh.renderMesh ? " render triangles." : " collision triangles.");
 }
 
+static bool RegisterBoxStudioLevel(Project& project, const std::string& levelName, std::string& error)
+{
+    const fs::path definesPath = project.root / "levels" / "level_defines.h";
+    std::string defines = Slurp(definesPath);
+    if (defines.empty()) {
+        error = "Could not read levels/level_defines.h for level registration.";
+        return false;
+    }
+    const std::string levelEnum = ToLevelEnumName(levelName);
+    if (defines.find(levelEnum) != std::string::npos) return true;
+
+    std::ostringstream line;
+    line << "DEFINE_LEVEL(\"BOXSTUDIO\",      " << levelEnum
+         << ",     COURSE_NONE,     " << levelName
+         << ",       generic,  20000, 0x08, 0x08, 0x08, _,         _)\n";
+
+    size_t insert = defines.find("STUB_LEVEL(  \"\",               LEVEL_UNKNOWN_37");
+    if (insert == std::string::npos) {
+        if (!defines.empty() && defines.back() != '\n') defines += "\n";
+        insert = defines.size();
+    }
+    defines.insert(insert, line.str());
+
+    std::ofstream out(definesPath, std::ios::binary);
+    if (!out) {
+        error = "Could not write levels/level_defines.h.";
+        return false;
+    }
+    out << defines;
+    return true;
+}
+
 static bool CreateBoxStudioLevel(Project& project, const std::string& rawName, LevelInfo& outLevel, std::string& error)
 {
-    const std::string levelName = SanitizeFolderName(rawName);
+    const std::string levelName = SanitizeLevelName(rawName);
+    const std::string levelEnum = ToLevelEnumName(levelName);
     fs::path levelPath = project.root / "levels" / levelName;
     std::error_code ec;
     if (fs::exists(levelPath, ec)) {
@@ -2169,15 +2451,27 @@ static bool CreateBoxStudioLevel(Project& project, const std::string& rawName, L
         return false;
     }
 
+    script << "#include <ultra64.h>\n";
+    script << "#include \"sm64.h\"\n";
+    script << "#include \"behavior_data.h\"\n";
+    script << "#include \"model_ids.h\"\n";
+    script << "#include \"seq_ids.h\"\n";
+    script << "#include \"segment_symbols.h\"\n";
+    script << "#include \"level_commands.h\"\n\n";
+    script << "#include \"game/level_update.h\"\n\n";
+    script << "#include \"levels/scripts.h\"\n\n";
+    script << "#include \"actors/common1.h\"\n\n";
+    script << "#include \"make_const_nonconst.h\"\n";
     script << "#include \"levels/" << levelName << "/header.h\"\n\n";
     script << "const LevelScript level_" << levelName << "_entry[] = {\n";
     script << "    INIT_LEVEL(),\n";
+    script << "    JUMP_LINK(script_func_global_1),\n";
     script << "    LOAD_MIO0(        0x07, _" << levelName << "_segment_7SegmentRomStart, _" << levelName << "_segment_7SegmentRomEnd),\n";
     script << "    AREA(1, " << levelName << "_geo_000000),\n";
-    script << "        WARP_NODE(0x0A, LEVEL_" << levelName << ", 0x01, 0x0A, WARP_NO_CHECKPOINT),\n";
+    script << "        WARP_NODE(0x0A, " << levelEnum << ", 0x01, 0x0A, WARP_NO_CHECKPOINT),\n";
     script << "        MARIO_POS(0x01, 0, 0, 120, 0),\n";
-    script << "        OBJECT(MODEL_GOOMBA, 300, 0, -180, 0, 0, 0, bhvGoomba),\n";
-    script << "        OBJECT(MODEL_YELLOW_COIN, -240, 80, 220, 0, 0, 0, bhvYellowCoin),\n";
+    script << "        OBJECT(MODEL_GOOMBA, 300, 0, -180, 0, 0, 0, 0x00000000, bhvGoomba),\n";
+    script << "        OBJECT(MODEL_YELLOW_COIN, -240, 80, 220, 0, 0, 0, 0x00000000, bhvYellowCoin),\n";
     script << "    END_AREA(),\n";
     script << "    MARIO_POS(0x01, 0, 0, 120, 0),\n";
     script << "    CALL(0, lvl_init_or_update),\n";
@@ -2199,28 +2493,30 @@ static bool CreateBoxStudioLevel(Project& project, const std::string& rawName, L
     collision << "    COL_VERTEX(-600, 0, -600),\n    COL_VERTEX(600, 0, -600),\n    COL_VERTEX(600, 0, 600),\n    COL_VERTEX(-600, 0, 600),\n";
     collision << "    COL_TRI_INIT(SURFACE_DEFAULT, 2),\n    COL_TRI(0, 1, 2),\n    COL_TRI(0, 2, 3),\n    COL_TRI_STOP(),\n    COL_END(),\n};\n";
 
+    if (!RegisterBoxStudioLevel(project, levelName, error)) return false;
+
     outLevel.name = levelName;
     outLevel.path = levelPath;
     outLevel.scriptPath = levelPath / "script.c";
     return true;
 }
 
-static LevelObject MakePresetObject(const char* name, const char* model, const char* behavior, Vec3 position, float scale)
+static LevelObject MakePresetObject(const char* name, const char* model, const char* behavior, Vec3 position, float scale, const char* behParam = "0x00000000")
 {
     LevelObject object;
     object.name = name;
     object.model = model;
-    object.behParam = "0x00000000";
+    object.behParam = behParam;
     object.behavior = behavior;
     object.position = position;
     object.scale = scale;
     return object;
 }
 
-static void AddPresetObject(AppState& app, const char* name, const char* model, const char* behavior, float scale = 1.0f)
+static void AddPresetObject(AppState& app, const char* name, const char* model, const char* behavior, float scale = 1.0f, const char* behParam = "0x00000000")
 {
     const float offset = static_cast<float>(app.objects.size() % 7) * 80.0f;
-    LevelObject object = MakePresetObject(name, model, behavior, { offset - 240.0f, 0.0f, offset * 0.5f }, scale);
+    LevelObject object = MakePresetObject(name, model, behavior, { offset - 240.0f, 0.0f, offset * 0.5f }, scale, behParam);
     app.objects.push_back(object);
     app.selectedObject = static_cast<int>(app.objects.size()) - 1;
     app.levelDirty = true;
@@ -2485,6 +2781,26 @@ static bool ProjectPointVisible(const Vec3& point, const AppState& app, const Im
 {
     out = ProjectPoint(point, app, origin, size, depth);
     return depth > 1.0f;
+}
+
+static float DistancePointToSegment(const ImVec2& point, const ImVec2& a, const ImVec2& b)
+{
+    const float vx = b.x - a.x;
+    const float vy = b.y - a.y;
+    const float wx = point.x - a.x;
+    const float wy = point.y - a.y;
+    const float lenSq = vx * vx + vy * vy;
+    if (lenSq <= 0.0001f) {
+        const float dx = point.x - a.x;
+        const float dy = point.y - a.y;
+        return sqrtf(dx * dx + dy * dy);
+    }
+    const float t = std::clamp((wx * vx + wy * vy) / lenSq, 0.0f, 1.0f);
+    const float px = a.x + vx * t;
+    const float py = a.y + vy * t;
+    const float dx = point.x - px;
+    const float dy = point.y - py;
+    return sqrtf(dx * dx + dy * dy);
 }
 
 static float TriangleAverageDepth(const MeshTriangle& tri, const AppState& app)
@@ -2820,6 +3136,13 @@ static void Draw3DViewport(AppState& app)
         draw->AddText(ImVec2(canvasPos.x + 12.0f, canvasPos.y + 30.0f), IM_COL32(230, 190, 90, 255), "No renderable level mesh found yet");
     }
 
+    const ImVec2 gizmoPanel(canvasPos.x + 12.0f, canvasPos.y + canvasSize.y - 58.0f);
+    draw->AddRectFilled(gizmoPanel, ImVec2(gizmoPanel.x + 178.0f, gizmoPanel.y + 30.0f), IM_COL32(16, 18, 20, 205), 4.0f);
+    draw->AddText(ImVec2(gizmoPanel.x + 10.0f, gizmoPanel.y + 8.0f), app.rotateGizmo ? IM_COL32(230, 210, 130, 255) : IM_COL32(160, 220, 185, 255),
+        app.rotateGizmo ? "Gizmo: Rotate" : "Gizmo: Move");
+    if (hovered && ImGui::IsKeyPressed(ImGuiKey_R, false)) app.rotateGizmo = true;
+    if (hovered && ImGui::IsKeyPressed(ImGuiKey_G, false)) app.rotateGizmo = false;
+
     int hoveredObject = -1;
     float bestDistance = 99999.0f;
     for (int i = 0; i < static_cast<int>(app.objects.size()); ++i) {
@@ -2834,10 +3157,68 @@ static void Draw3DViewport(AppState& app)
         }
     }
 
-    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        app.selectedObject = hoveredObject;
+    int hoveredAxis = -1;
+    ImVec2 axisStart{};
+    std::array<ImVec2, 3> axisEnds{};
+    std::array<bool, 3> axisVisible{ false, false, false };
+    if (app.selectedObject >= 0 && app.selectedObject < static_cast<int>(app.objects.size())) {
+        const Vec3 origin = app.objects[app.selectedObject].position;
+        float originDepth = 0.0f;
+        if (ProjectPointVisible(origin, app, canvasPos, canvasSize, axisStart, originDepth)) {
+            const float axisLen = std::clamp(originDepth * 0.16f, 120.0f, 420.0f);
+            const Vec3 axisPoints[3] = {
+                { origin.x + axisLen, origin.y, origin.z },
+                { origin.x, origin.y + axisLen, origin.z },
+                { origin.x, origin.y, origin.z + axisLen }
+            };
+            float bestAxisDistance = 16.0f;
+            for (int axis = 0; axis < 3; ++axis) {
+                float depth = 0.0f;
+                axisVisible[axis] = ProjectPointVisible(axisPoints[axis], app, canvasPos, canvasSize, axisEnds[axis], depth);
+                if (!axisVisible[axis]) continue;
+                const float dist = DistancePointToSegment(mouse, axisStart, axisEnds[axis]);
+                if (dist < bestAxisDistance) {
+                    hoveredAxis = axis;
+                    bestAxisDistance = dist;
+                }
+            }
+        }
     }
-    if (hovered && app.selectedObject >= 0 && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (hoveredAxis >= 0) {
+            app.activeGizmoAxis = hoveredAxis;
+        } else {
+            app.selectedObject = hoveredObject;
+            app.activeGizmoAxis = -1;
+        }
+    }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        app.activeGizmoAxis = -1;
+    }
+    if (hovered && app.selectedObject >= 0 && app.activeGizmoAxis >= 0 && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        ImVec2 delta = ImGui::GetIO().MouseDelta;
+        const ImVec2 a = axisStart;
+        const ImVec2 b = axisEnds[app.activeGizmoAxis];
+        const float vx = b.x - a.x;
+        const float vy = b.y - a.y;
+        const float len = std::max(1.0f, sqrtf(vx * vx + vy * vy));
+        const float signedPixels = (delta.x * vx + delta.y * vy) / len;
+        if (app.rotateGizmo) {
+            float* components[3] = {
+                &app.objects[app.selectedObject].rotation.x,
+                &app.objects[app.selectedObject].rotation.y,
+                &app.objects[app.selectedObject].rotation.z
+            };
+            *components[app.activeGizmoAxis] += signedPixels * 0.6f;
+        } else {
+            Vec3* pos = &app.objects[app.selectedObject].position;
+            if (app.activeGizmoAxis == 0) pos->x += signedPixels * 3.0f;
+            if (app.activeGizmoAxis == 1) pos->y += signedPixels * 3.0f;
+            if (app.activeGizmoAxis == 2) pos->z += signedPixels * 3.0f;
+        }
+        app.levelDirty = true;
+    } else if (hovered && app.selectedObject >= 0 && ImGui::IsMouseDragging(ImGuiMouseButton_Left) && hoveredAxis < 0) {
         ImVec2 delta = ImGui::GetIO().MouseDelta;
         app.objects[app.selectedObject].position.x += delta.x * 2.0f;
         app.objects[app.selectedObject].position.z += delta.y * 2.0f;
@@ -2874,6 +3255,12 @@ static void Draw3DViewport(AppState& app)
             draw->AddRectFilled(ImVec2(p.x - r * 1.05f, p.y + r * 0.2f), ImVec2(p.x + r * 1.05f, p.y + r * 1.15f), IM_COL32(92, 48, 28, 255), 4.0f);
             draw->AddCircleFilled(ImVec2(p.x - r * 0.42f, p.y - r * 0.35f), r * 0.18f, IM_COL32(24, 18, 16, 255));
             draw->AddCircleFilled(ImVec2(p.x + r * 0.42f, p.y - r * 0.35f), r * 0.18f, IM_COL32(24, 18, 16, 255));
+        } else if (signature.find("KOOPA") != std::string::npos || signature.find("Koopa") != std::string::npos) {
+            draw->AddCircleFilled(ImVec2(p.x, p.y - r * 0.15f), r * 1.05f, IM_COL32(75, 170, 64, 255), 24);
+            draw->AddCircleFilled(ImVec2(p.x, p.y + r * 0.28f), r * 0.78f, IM_COL32(230, 202, 88, 255), 24);
+            draw->AddCircleFilled(ImVec2(p.x, p.y - r * 1.1f), r * 0.48f, IM_COL32(82, 190, 72, 255), 18);
+            draw->AddCircleFilled(ImVec2(p.x - r * 0.36f, p.y - r * 1.18f), r * 0.08f, IM_COL32(20, 24, 16, 255));
+            draw->AddCircleFilled(ImVec2(p.x + r * 0.36f, p.y - r * 1.18f), r * 0.08f, IM_COL32(20, 24, 16, 255));
         } else {
             draw->AddRectFilled(ImVec2(p.x - r, p.y - r), ImVec2(p.x + r, p.y + r), fill, 3.0f);
             draw->AddLine(ImVec2(p.x - r, p.y - r), ImVec2(p.x + r, p.y + r), IM_COL32(210, 230, 236, 120), 1.0f);
@@ -2885,8 +3272,30 @@ static void Draw3DViewport(AppState& app)
         }
     }
 
+    if (app.selectedObject >= 0 && app.selectedObject < static_cast<int>(app.objects.size())) {
+        const ImU32 axisColors[3] = {
+            IM_COL32(235, 75, 75, 245),
+            IM_COL32(82, 210, 105, 245),
+            IM_COL32(78, 145, 245, 245)
+        };
+        const char* labels[3] = { "X", "Y", "Z" };
+        for (int axis = 0; axis < 3; ++axis) {
+            if (!axisVisible[axis]) continue;
+            const bool active = app.activeGizmoAxis == axis;
+            const bool hotAxis = hoveredAxis == axis;
+            const float thickness = active ? 5.0f : (hotAxis ? 4.0f : 2.5f);
+            draw->AddLine(axisStart, axisEnds[axis], axisColors[axis], thickness);
+            if (app.rotateGizmo) {
+                draw->AddCircle(axisStart, DistancePointToSegment(axisEnds[axis], axisStart, axisEnds[axis]) + 18.0f + axis * 7.0f,
+                    axisColors[axis], 48, hotAxis || active ? 2.5f : 1.5f);
+            }
+            draw->AddCircleFilled(axisEnds[axis], hotAxis || active ? 7.5f : 6.0f, axisColors[axis], 18);
+            draw->AddText(ImVec2(axisEnds[axis].x + 8.0f, axisEnds[axis].y - 8.0f), axisColors[axis], labels[axis]);
+        }
+    }
+
     draw->AddText(ImVec2(canvasPos.x + 12.0f, canvasPos.y + 10.0f), IM_COL32(198, 206, 208, 255),
-        app.flyCamera ? "Right-drag look  WASD/QE fly  Shift faster  Left-drag selected object" : "Right-drag orbit  Middle-drag pan  Wheel zoom  Left-drag selected object");
+        app.flyCamera ? "Right-drag look  WASD/QE fly  G move gizmo  R rotate gizmo" : "Right-drag orbit  Middle-drag pan  Wheel zoom  G move gizmo  R rotate gizmo");
     ImGui::EndChild();
 }
 
@@ -2900,13 +3309,14 @@ static void RenderEditor(AppState& app)
     ImGui::BeginDisabled(loadingLevel || app.editorMode != EditorMode::EditingLevel || app.selectedLevel < 0);
     if (ImGui::Button("Save And Write", ImVec2(130.0f, 26.0f))) {
         std::string error;
+        std::string warning;
         if (!WriteLevelScene(app.project, app.levels[app.selectedLevel], app.objects, error)) {
             app.status = "Scene save failed: " + error;
-        } else if (!WriteObjectsToLevelScript(app.levels[app.selectedLevel], app.objects, error)) {
+        } else if (!WriteObjectsToLevelScript(app.levels[app.selectedLevel], app.objects, error, &warning)) {
             app.status = "Script write failed: " + error;
         } else {
             app.levelDirty = false;
-            app.status = "Saved and wrote level script.";
+            app.status = warning.empty() ? "Saved and wrote level script." : warning;
         }
     }
     ImGui::SameLine();
@@ -2959,8 +3369,22 @@ static void RenderEditor(AppState& app)
     ImGui::Separator();
     ImGui::Text("Add To Level");
     ImGui::BeginDisabled(loadingLevel || app.editorMode != EditorMode::EditingLevel);
+    const bool canAddGoomba = app.selectedLevel >= 0 && app.selectedLevel < static_cast<int>(app.levels.size()) &&
+        LevelScriptSupportsModel(app.levels[app.selectedLevel], "MODEL_GOOMBA");
+    const bool canAddKoopa = app.selectedLevel >= 0 && app.selectedLevel < static_cast<int>(app.levels.size()) &&
+        LevelScriptSupportsModel(app.levels[app.selectedLevel], "MODEL_KOOPA_WITH_SHELL");
+    ImGui::BeginDisabled(!canAddGoomba);
     if (ImGui::Button("Goomba", ImVec2(-1.0f, 28.0f))) AddPresetObject(app, "Goomba", "MODEL_GOOMBA", "bhvGoomba");
-    if (ImGui::Button("Koopa", ImVec2(-1.0f, 28.0f))) AddPresetObject(app, "Koopa", "MODEL_KOOPA_WITH_SHELL", "bhvKoopa");
+    if (!canAddGoomba && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("This level must load common0 before Goombas can be written safely.");
+    }
+    ImGui::EndDisabled();
+    ImGui::BeginDisabled(!canAddKoopa);
+    if (ImGui::Button("Koopa", ImVec2(-1.0f, 28.0f))) AddPresetObject(app, "Koopa", "MODEL_KOOPA_WITH_SHELL", "bhvKoopa", 1.0f, "0x00010000");
+    if (!canAddKoopa && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Koopa belongs to actor group14. This level is using another segment 0x06/0x0D actor group.");
+    }
+    ImGui::EndDisabled();
     if (ImGui::Button("Coin", ImVec2(-1.0f, 28.0f))) AddPresetObject(app, "Yellow Coin", "MODEL_YELLOW_COIN", "bhvYellowCoin", 0.75f);
     if (ImGui::Button("Star", ImVec2(-1.0f, 28.0f))) AddPresetObject(app, "Power Star", "MODEL_STAR", "bhvStar", 1.15f);
     if (ImGui::Button("Warp Pipe", ImVec2(-1.0f, 28.0f))) AddPresetObject(app, "Warp Pipe", "MODEL_BITS_WARP_PIPE", "bhvWarpPipe", 1.45f);
@@ -3131,13 +3555,16 @@ static void RenderEditor(AppState& app)
     if (app.selectedLevel >= 0 && app.selectedLevel < static_cast<int>(app.levels.size())) {
         if (ImGui::Button("Save And Write", ImVec2(150.0f, 30.0f))) {
             std::string error;
+            std::string warning;
             if (!WriteLevelScene(app.project, app.levels[app.selectedLevel], app.objects, error)) {
                 app.status = "Scene save failed: " + error;
-            } else if (!WriteObjectsToLevelScript(app.levels[app.selectedLevel], app.objects, error)) {
+            } else if (!WriteObjectsToLevelScript(app.levels[app.selectedLevel], app.objects, error, &warning)) {
                 app.status = "Script write failed: " + error;
             } else {
                 app.levelDirty = false;
-                app.status = "Saved metadata and wrote object changes to " + app.levels[app.selectedLevel].scriptPath.filename().string() + ".";
+                app.status = warning.empty()
+                    ? "Saved metadata and wrote object changes to " + app.levels[app.selectedLevel].scriptPath.filename().string() + "."
+                    : warning;
             }
         }
         ImGui::SameLine();
@@ -3204,13 +3631,48 @@ static bool SaveAndWriteCurrentLevel(AppState& app)
         app.status = "Scene save failed: " + error;
         return false;
     }
-    if (!WriteObjectsToLevelScript(app.levels[app.selectedLevel], app.objects, error)) {
+    std::string warning;
+    if (!WriteObjectsToLevelScript(app.levels[app.selectedLevel], app.objects, error, &warning)) {
         app.status = "Script write failed: " + error;
         return false;
     }
     app.levelDirty = false;
-    app.status = "Saved and wrote level changes.";
+    app.status = warning.empty() ? "Saved and wrote level changes." : warning;
     return true;
+}
+
+static int RunHeadlessRepairLevel(const fs::path& projectPath, const std::string& levelName)
+{
+    Project project;
+    std::string error;
+    if (!LoadProject(projectPath, project, error)) {
+        printf("BoxStudio repair failed: %s\n", error.c_str());
+        return 2;
+    }
+
+    std::vector<LevelInfo> levels = DiscoverLevels(project.root);
+    auto levelIt = std::find_if(levels.begin(), levels.end(), [&](const LevelInfo& level) {
+        return level.name == levelName;
+    });
+    if (levelIt == levels.end()) {
+        printf("BoxStudio repair failed: level '%s' was not found.\n", levelName.c_str());
+        return 3;
+    }
+
+    std::vector<LevelObject> objects = ParseLevelObjects(*levelIt);
+    std::string warning;
+    if (!WriteLevelScene(project, *levelIt, objects, error)) {
+        printf("BoxStudio repair failed: %s\n", error.c_str());
+        return 4;
+    }
+    if (!WriteObjectsToLevelScript(*levelIt, objects, error, &warning)) {
+        printf("BoxStudio repair failed: %s\n", error.c_str());
+        return 5;
+    }
+
+    printf("BoxStudio repaired %s/%s.\n", project.root.string().c_str(), levelName.c_str());
+    if (!warning.empty()) printf("%s\n", warning.c_str());
+    return 0;
 }
 
 static void LeaveLevelEditor(AppState& app)
@@ -3260,8 +3722,12 @@ static void RenderUnsavedPopup(AppState& app)
     }
 }
 
-int main(int, char**)
+int main(int argc, char** argv)
 {
+    if (argc >= 4 && std::string(argv[1]) == "--repair-level") {
+        return RunHeadlessRepairLevel(fs::path(argv[2]), argv[3]);
+    }
+
     ::AllocConsole();
     freopen_s(reinterpret_cast<FILE**>(stdout), "CONOUT$", "w", stdout);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
