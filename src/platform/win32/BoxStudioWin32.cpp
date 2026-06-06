@@ -3724,6 +3724,10 @@ static void RenderUnsavedPopup(AppState& app)
 
 int main(int argc, char** argv)
 {
+    if (argc >= 2 && std::string(argv[1]) == "--version") {
+        printf("BoxStudio 0.1.0-dev\n");
+        return 0;
+    }
     if (argc >= 4 && std::string(argv[1]) == "--repair-level") {
         return RunHeadlessRepairLevel(fs::path(argv[2]), argv[3]);
     }
