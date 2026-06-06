@@ -8,6 +8,20 @@ The long-term target is broader than SM64. BoxStudio is being designed around de
 
 ## Current Status
 
+<img width="2559" height="1391" alt="Screenshot 2026-06-02 151228" src="https://github.com/user-attachments/assets/41caeb37-566f-4fed-abe9-6ba468a7f548" />
+<img width="2559" height="1392" alt="Screenshot 2026-06-02 151417" src="https://github.com/user-attachments/assets/c08ab623-7af1-4c92-83ae-fc11026b73ef" />
+<img width="2559" height="1391" alt="Screenshot 2026-06-02 151454" src="https://github.com/user-attachments/assets/c42cfd95-0168-46ed-8536-91cf360aa178" />
+<img width="2559" height="1392" alt="Screenshot 2026-06-02 151512" src="https://github.com/user-attachments/assets/7dc29d6f-de01-4fd9-8aea-0ef77f457a5e" />
+<img width="2559" height="1390" alt="Screenshot 2026-06-02 151544" src="https://github.com/user-attachments/assets/cd252576-4740-4155-a715-f3060297907f" />
+<img width="2559" height="1392" alt="Screenshot 2026-06-02 151736" src="https://github.com/user-attachments/assets/5be2fd0c-f2f9-454b-8e37-d359aef328fd" />
+<img width="2559" height="1391" alt="Screenshot 2026-06-02 151844" src="https://github.com/user-attachments/assets/b5db85ea-e8c3-4b44-99ff-50620c46efc6" />
+<img width="2559" height="1390" alt="Screenshot 2026-06-02 151915" src="https://github.com/user-attachments/assets/966a3299-82dc-4aa3-8bef-cfd1a2c0a5e2" />
+
+
+https://github.com/user-attachments/assets/88cc17d0-f7f8-481d-a324-a368031dd12b
+
+**The Goomba, Coin, and Star were all added into the Castle Grounds using BoxStudio. This video was recorded using ares v148.** ***NOTE that the game crashes after collecting the star, and does not save the game, which is an issue in which we are hoping to come up with a solution soon.***
+
 BoxStudio is in active early development. Expect missing tools, changing project metadata, and rough editor workflows. The important pieces that are already taking shape are:
 
 - Project creation from an existing built HackerSM64 decomp tree.
@@ -103,6 +117,8 @@ make CROSS=mips-linux-gnu- -j4
 ```
 
 ## Contributing
+
+It's important to note that BoxStudio's codebase (as of now) is quite messy, because most of it is currently written by [Codex](https://openai.com/codex/) which does go against our "**No AI/LLM code**" rule in contributing to this project. See [CONTRIBUTING](CONTRIBUTING.md). This will change in the future and more human code will be present, which is why we are directly open to contributors!
 
 BoxStudio is not ready for broad feature work without coordination yet, but useful contributions include:
 
