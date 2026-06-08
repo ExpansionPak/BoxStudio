@@ -1,6 +1,8 @@
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
+#include "BoxStudioApp.h"
+#include "decomps/sm64/hackersm64/HackerSM64.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -368,12 +370,6 @@ static fs::path DefaultProjectsRoot()
     return fs::current_path() / "Projects";
 }
 
-static bool Has(const fs::path& root, const char* child)
-{
-    std::error_code ec;
-    return fs::exists(root / child, ec);
-}
-
 static bool PickFolder(fs::path& outPath)
 {
     IFileOpenDialog* dialog = nullptr;
@@ -433,32 +429,7 @@ static bool PickTextureFile(fs::path& outPath)
 
 static bool ValidateHackerSm64(const fs::path& root, std::string& reason, bool& built)
 {
-    std::error_code ec;
-    if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
-        reason = "Folder does not exist.";
-        built = false;
-        return false;
-    }
-
-    std::vector<std::string> missing;
-    for (const char* required : { "Makefile", "src", "actors", "assets", "levels", "textures", "include/config" }) {
-        if (!Has(root, required)) missing.emplace_back(required);
-    }
-
-    built = Has(root, "build");
-    if (!missing.empty()) {
-        std::ostringstream ss;
-        ss << "Missing ";
-        for (size_t i = 0; i < missing.size(); ++i) {
-            if (i > 0) ss << ", ";
-            ss << missing[i];
-        }
-        reason = ss.str();
-        return false;
-    }
-
-    reason = built ? "Valid built HackerSM64 workspace detected." : "Valid HackerSM64 workspace detected. Build folder not found yet.";
-    return true;
+    return boxstudio::decomps::sm64::hackersm64::ValidateWorkspace(root, reason, built);
 }
 
 static bool WriteManifest(const Project& project, std::string& error)
@@ -563,14 +534,7 @@ static std::string ModelLoadCommandFor(const std::string& model)
 
 static std::string ModelSegmentRequirement(const std::string& model)
 {
-    static const std::unordered_map<std::string, std::string> requirements = {
-        { "MODEL_GOOMBA", "_common0_" },
-        { "MODEL_KOOPA_WITH_SHELL", "_group14_" },
-        { "MODEL_BITS_WARP_PIPE", "_common1_" },
-        { "MODEL_THI_WARP_PIPE", "_common1_" }
-    };
-    auto it = requirements.find(model);
-    return it == requirements.end() ? std::string{} : it->second;
+    return boxstudio::decomps::sm64::hackersm64::ModelSegmentRequirement(model);
 }
 
 static std::string ModelSupportProblem(const std::string& script, const LevelObject& object)
@@ -579,16 +543,7 @@ static std::string ModelSupportProblem(const std::string& script, const LevelObj
         return "object is missing a model or behavior.";
     }
 
-    const std::string required = ModelSegmentRequirement(object.model);
-    if (required.empty() || script.find(required) != std::string::npos) return {};
-
-    if (object.model == "MODEL_KOOPA_WITH_SHELL") {
-        return "Koopa needs actor group14 loaded in segment 0x06/0x0D.";
-    }
-    if (object.model == "MODEL_GOOMBA") {
-        return "Goomba needs common0 loaded in segment 0x08/0x0F.";
-    }
-    return object.model + " needs " + required + " loaded by this level.";
+    return boxstudio::decomps::sm64::hackersm64::UnsupportedModelReason(object.model, script);
 }
 
 static bool LevelScriptSupportsModel(const LevelInfo& level, const std::string& model)
@@ -3722,7 +3677,7 @@ static void RenderUnsavedPopup(AppState& app)
     }
 }
 
-int main(int argc, char** argv)
+int RunBoxStudio(int argc, char** argv)
 {
     if (argc >= 2 && std::string(argv[1]) == "--version") {
         printf("BoxStudio 0.1.0-dev\n");

@@ -16,6 +16,8 @@ endif()
 
 if(BOXSTUDIO_BUILD_GUI)
     add_executable(BoxStudio WIN32
+        src/main.cpp
+        src/decomps/sm64/hackersm64/HackerSM64.cpp
         src/platform/win32/BoxStudioWin32.cpp
         third_party/imgui/imgui.cpp
         third_party/imgui/imgui_demo.cpp
@@ -41,6 +43,8 @@ if(BOXSTUDIO_BUILD_GUI)
     endif()
 else()
     add_executable(BoxStudio
+        src/main.cpp
+        src/decomps/sm64/hackersm64/HackerSM64.cpp
         src/platform/portable/BoxStudioPortable.cpp
     )
 

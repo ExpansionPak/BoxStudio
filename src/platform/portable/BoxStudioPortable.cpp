@@ -3,6 +3,9 @@
 #include <iostream>
 #include <string>
 
+#include "BoxStudioApp.h"
+#include "decomps/sm64/hackersm64/HackerSM64.h"
+
 namespace fs = std::filesystem;
 
 static int PrintUsage()
@@ -23,8 +26,6 @@ static int PrintUsage()
 static int CheckProject(const fs::path& root)
 {
     const fs::path manifest = root / ".boxstudio" / "boxstudio.project.json";
-    const fs::path levels = root / "levels";
-    const fs::path actors = root / "actors";
 
     bool ok = true;
     auto require = [&](const fs::path& path, const char* label) {
@@ -35,8 +36,13 @@ static int CheckProject(const fs::path& root)
     };
 
     require(manifest, "BoxStudio manifest");
-    require(levels, "levels folder");
-    require(actors, "actors folder");
+
+    std::string reason;
+    bool built = false;
+    if (!boxstudio::decomps::sm64::hackersm64::ValidateWorkspace(root, reason, built)) {
+        std::cerr << "Invalid HackerSM64 workspace: " << reason << "\n";
+        ok = false;
+    }
 
     if (ok) {
         std::cout << "Project looks like a BoxStudio HackerSM64 workspace: "
@@ -46,7 +52,7 @@ static int CheckProject(const fs::path& root)
     return 2;
 }
 
-int main(int argc, char** argv)
+int RunBoxStudio(int argc, char** argv)
 {
     if (argc <= 1) return PrintUsage();
 

@@ -1,6 +1,3 @@
-// PLACEHOLDER Log.cpp
-
-// This file is a placeholder and should be replaced with the actual logging implementation for the project
-// Logging functions, log levels, log file management, etc. should be implemented here.
+// This file does not contain code yet and is just a placeholder for the Log class implementation. The Log class provides static methods for logging information, warnings, and errors. The actual implementation of these methods will be added in the future.
 
 #include "Log.h"

@@ -89,12 +89,15 @@ BoxStudio --check-project /path/to/BoxStudioProject
 
 ```text
 src/
+  main.cpp              Thin application entrypoint.
+  BoxStudioApp.h        Shared platform app entrypoint contract.
   core/                 Application-level systems and future shared services.
-  editor/               Editor domain code as it is extracted from the prototype.
+  decomps/
+    sm64/
+      hackersm64/       HackerSM64 workspace and level-script compatibility rules.
   platform/
     win32/              Current full Win32/DX11 editor implementation.
     portable/           Cross-platform CLI shell used by CI and non-Windows work.
-  ui/                   Future UI panels and reusable editor widgets.
 docs/                   Format notes and design notes.
 third_party/imgui/      Dear ImGui submodule.
 ```

@@ -1,4 +1,12 @@
-// PLACEHOLDER Log.h
+#ifndef LOG_H
+#define LOG_H
 
-// This file is a placeholder and should be replaced with the actual logging header for the project
-// Log level definitions, log function declarations, etc. should be implemented here.
+#include <string>
+class Log {
+public:
+    static void Info(const std::string& message);
+    static void Warning(const std::string& message);
+    static void Error(const std::string& message);
+};
+
+#endif // LOG_H
