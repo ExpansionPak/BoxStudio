@@ -4,6 +4,8 @@ BoxStudio is an early visual editor for N64 decomp-based ROM hacking projects, s
 
 The long-term target is broader than SM64. BoxStudio is being designed around decomp bases such as HackerSM64, [HackerOoT](https://github.com/HackerN64/HackerOoT), and zeldaret's [mm](https://github.com/zeldaret/mm), but the current implementation is focused on proving the HackerSM64 workflow first.
 
+To test the Capabilities of BoxStudio, we have made a [small ROM hack of SM64 using it](https://drive.google.com/file/d/1pNw4lFuD-2DfpKBhujpwfgANpGAirklM/view?usp=sharing). Not much changes except the Castle grounds fence is now the Troll face, there are 2 goombas, 4 coins, and 1 star. (Note that collecting the star causes the game to crash due to an issue with the game itself.). You should use [ares v148](https://github.com/ares-emulator/ares/releases/tag/v148) for this ROM hack.
+
 > BoxStudio does not use proprietary N64 SDKs or libraries.
 
 ## Current Status
