@@ -1,4 +1,4 @@
-#include "decomps/sm64/hackersm64/HackerSM64.h"
+#include "HackerSM64.h"
 
 #include <sstream>
 #include <unordered_map>

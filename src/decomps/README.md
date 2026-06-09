@@ -7,6 +7,10 @@ Current layout:
 
 ```text
 decomps/
+  oot/
+    hackeroot/       HackerOoT workspace validation.
+  pm/
+    papermario-dx/   Paper Mario DX workspace validation.
   sm64/
     hackersm64/     HackerSM64 workspace validation and level-script rules.
 ```

@@ -2,7 +2,7 @@
 
 BoxStudio is an early visual editor for N64 decomp-based ROM hacking projects, starting with [HackerSM64](https://github.com/HackerN64/HackerSM64). The goal is to make decomp ROM hacking feel closer to using a small game editor: create a project, open a level, inspect real geometry, place objects, save changes, rebuild the ROM, and test on accurate emulators or real hardware.
 
-The long-term target is broader than SM64. BoxStudio is being designed around decomp bases such as HackerSM64, zeldaret's [OoT](https://github.com/zeldaret/oot), and zeldaret's [MM](https://github.com/zeldaret/mm), but the current implementation is focused on proving the HackerSM64 workflow first.
+The long-term target is broader than SM64. BoxStudio is being designed around decomp bases such as HackerSM64, [HackerOoT](https://github.com/HackerN64/HackerOoT), and zeldaret's [mm](https://github.com/zeldaret/mm), but the current implementation is focused on proving the HackerSM64 workflow first.
 
 > BoxStudio does not use proprietary N64 SDKs or libraries.
 
@@ -38,7 +38,15 @@ BoxStudio is in active early development. Expect missing tools, changing project
 
 BoxStudio was originally imagined as a visual ROM and raw assembly hacking tool. That direction was dropped because raw ROM hacking becomes painful very quickly, even with matching C code beside the disassembly. Decomp projects already expose source files, level scripts, assets, model declarations, and build systems, so BoxStudio now works with those structures instead of fighting the raw ROM directly.
 
+**TLDR**: raw ROM hacking is and will remain a pain in the ass.
+
 The editor copies a decomp workspace into a BoxStudio project folder, then writes normal project files back into that copied tree. Rebuilding the ROM remains the job of the decomp base.
+
+## Games and Decomp bases currently supported:
+
+[Super Mario 64: HackerSM64](https://github.com/HackerN64/HackerSM64) is the only supported game and decomp base supported as of now, altough in the future, there will be much more games and decomp bases to be supported. It is also possible that both HackerSM64 and the [Vanilla SM64 Decomp](https://github.com/n64decomp/sm64) will be supported.
+
+[HackerOoT](https://github.com/HackerN64/HackerOoT) and [papermario-dx](https://github.com/bates64/papermario-dx) support are currently being worked on. No AI bullshit, [I promise](https://i.imgflip.com/4jfifn.jpg).
 
 ## Recommended Testing
 
@@ -91,10 +99,19 @@ BoxStudio --check-project /path/to/BoxStudioProject
 src/
   main.cpp              Thin application entrypoint.
   BoxStudioApp.h        Shared platform app entrypoint contract.
-  core/                 Application-level systems and future shared services.
+  app/                  Editor state, app commands, and lifecycle glue.
+  core/                 Shared utilities and future common services.
   decomps/
+    oot/
+      hackeroot/        HackerOoT workspace rules.
+    pm/
+      papermario-dx/    Paper Mario DX workspace rules.
     sm64/
       hackersm64/       HackerSM64 workspace and level-script compatibility rules.
+  editor/               Level editor loading and object-editing workflow.
+  project/              Project manifests, level discovery, and script writes.
+  renderer/             Level render data extraction and viewport rendering.
+  ui/                   ImGui panels and editor presentation.
   platform/
     win32/              Current full Win32/DX11 editor implementation.
     portable/           Cross-platform CLI shell used by CI and non-Windows work.
@@ -106,7 +123,7 @@ The current editor implementation is still larger than it should be. Public-faci
 
 1. Keep platform-specific code out of the root source folder.
 2. Preserve a working Windows editor while Linux/macOS builds stay valid.
-3. Extract HackerSM64 project, level-script, texture, and renderer systems into focused modules.
+3. Convert the current implementation fragments into normal .cpp/.h modules with tests.
 4. Add tests around project metadata, level-script writes, and actor-group compatibility.
 
 ## HackerSM64 Notes
@@ -119,9 +136,11 @@ When rebuilding a HackerSM64 project, use the toolchain command expected by your
 make CROSS=mips-linux-gnu- -j4
 ```
 
-## Contributing
+## PC Port mods?
 
-It's important to note that BoxStudio's codebase (as of now) is quite messy, because most of it is currently written by [Codex](https://openai.com/codex/) which does go against our "**No AI/LLM code**" rule in contributing to this project. See [CONTRIBUTING](CONTRIBUTING.md). This will change in the future and more human code will be present, which is why we are directly open to contributors!
+There have been some questions about exporting ROM hacks made with BoxStudio into stuff like a native binary (Or exporting MM Rom Hacks as mods for the [MM Recomp](https://github.com/Zelda64Recomp/Zelda64Recomp)). Unfortunately, this is **not** in our current scope, and will likely never be a real feature in BoxStudio. The main goal of this project is to make modding easier, not make mods for sm64coopdx or any other N64 PC Ports.
+
+## Contributing
 
 BoxStudio is not ready for broad feature work without coordination yet, but useful contributions include:
 
