@@ -8,6 +8,9 @@ To test the Capabilities of BoxStudio, we have made a [small ROM hack of SM64 us
 
 > BoxStudio does not use proprietary N64 SDKs or libraries.
 
+## ARCHIVE NOTICE
+BoxStudio has been an incredible proof of concept for a project that will become a game changer for N64 rom hacking with decomps, but it's very experimental and buggy, which is why BoxStudio is now cancelled... AND We are currently reweriting it into "BoxStudioPlus", which WILL be more complete with features. 
+
 ## Current Status
 
 <img width="2559" height="1391" alt="Screenshot 2026-06-02 151228" src="https://github.com/user-attachments/assets/41caeb37-566f-4fed-abe9-6ba468a7f548" />
